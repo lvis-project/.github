@@ -1,0 +1,57 @@
+name: plugin-ci (reusable)
+on:
+  workflow_call:
+    inputs:
+      node-version:
+        type: string
+        default: '20'
+      bun-version:
+        type: string
+        default: '1.1.38'
+concurrency:
+  group: plugin-ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: oven-sh/setup-bun@v1
+        with:
+          bun-version: ${{ inputs.bun-version }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+      - name: Verify submodule integrity
+        run: |
+          if [ -f .gitmodules ]; then
+            git submodule status
+            while read -r line; do
+              sha=$(echo "$line" | awk '{print $1}' | sed 's/^-//')
+              path=$(echo "$line" | awk '{print $2}')
+              if [ -d "$path" ]; then
+                (cd "$path" && git describe --exact-match --tags HEAD >/dev/null 2>&1) || {
+                  echo "::warning::Submodule $path ($sha) is not pinned to a tag"
+                }
+              fi
+            done < <(git submodule status)
+          fi
+      - name: Install
+        run: bun install --frozen-lockfile
+      - name: Lint (if script exists)
+        run: |
+          if grep -q '"lint"' package.json; then bun run lint; else echo "no lint script — skipping"; fi
+      - name: Typecheck (if script exists)
+        run: |
+          if grep -q '"typecheck"' package.json; then bun run typecheck; else echo "no typecheck script — skipping"; fi
+      - name: Test (if script exists)
+        run: |
+          if grep -q '"test"' package.json; then bun run test; else echo "no test script — skipping"; fi
+      - name: Build
+        run: bun run build

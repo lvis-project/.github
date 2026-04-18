@@ -1,0 +1,7 @@
+{
+  "name": "LVIS Plugin CI",
+  "description": "Bun + Node CI for lvis-plugin-* repos (reusable workflow wrapper)",
+  "iconName": "workflow-template-icon",
+  "categories": ["TypeScript", "Node"],
+  "filePatterns": ["plugin.json"]
+}
