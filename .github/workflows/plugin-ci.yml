@@ -18,29 +18,29 @@ jobs:
       contents: read
       actions: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
         with:
           submodules: recursive
           token: ${{ secrets.GITHUB_TOKEN }}
-      - uses: oven-sh/setup-bun@v1
+      - uses: oven-sh/setup-bun@f4d14e03ff726c06358e5557344e1da148b56cf7  # v1
         with:
           bun-version: ${{ inputs.bun-version }}
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4
         with:
           node-version: ${{ inputs.node-version }}
       - name: Verify submodule integrity
         run: |
           if [ -f .gitmodules ]; then
             git submodule status
-            while read -r line; do
-              sha=$(echo "$line" | awk '{print $1}' | sed 's/^-//')
-              path=$(echo "$line" | awk '{print $2}')
-              if [ -d "$path" ]; then
-                (cd "$path" && git describe --exact-match --tags HEAD >/dev/null 2>&1) || {
-                  echo "::warning::Submodule $path ($sha) is not pinned to a tag"
-                }
+            while IFS= read -r path; do
+              if [ ! -e "$path/.git" ]; then
+                echo "::error::Submodule $path not initialized"
+                exit 1
               fi
-            done < <(git submodule status)
+              (cd "$path" && git describe --exact-match --tags HEAD >/dev/null 2>&1) || {
+                echo "::warning::Submodule $path is not pinned to a tag"
+              }
+            done < <(git config --file .gitmodules --get-regexp '\.path$' | awk '{print $2}')
           fi
       - name: Install
         run: bun install --frozen-lockfile
