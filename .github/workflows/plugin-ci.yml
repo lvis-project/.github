@@ -13,7 +13,11 @@ concurrency:
   cancel-in-progress: true
 jobs:
   build-test:
-    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+      fail-fast: false
+    runs-on: ${{ matrix.os }}
     permissions:
       contents: read
     steps:
@@ -28,6 +32,7 @@ jobs:
         with:
           node-version: ${{ inputs.node-version }}
       - name: Verify submodule integrity
+        shell: bash
         run: |
           if [ -f .gitmodules ]; then
             git submodule status
@@ -44,12 +49,15 @@ jobs:
       - name: Install
         run: bun install --frozen-lockfile
       - name: Lint (if script exists)
+        shell: bash
         run: |
           if grep -q '"lint"' package.json; then bun run lint; else echo "no lint script — skipping"; fi
       - name: Typecheck (if script exists)
+        shell: bash
         run: |
           if grep -q '"typecheck"' package.json; then bun run typecheck; else echo "no typecheck script — skipping"; fi
       - name: Test (if script exists)
+        shell: bash
         run: |
           if grep -q '"test"' package.json; then bun run test; else echo "no test script — skipping"; fi
       - name: Build
