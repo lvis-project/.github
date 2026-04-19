@@ -1,0 +1,29 @@
+
+# Tooling
+.omc
+.omc/
+
+# Standard & Tooling
+.DS_Store
+node_modules/
+dist/
+build/
+.env
+.venv/
+__pycache__/
+.claude/
+.pytest_cache/
+coverage/
+
+# --- Added by Gemini (Standard Patterns) ---
+.next/
+.npm
+.eslintcache
+*.log
+.python-version
+.coverage
+htmlcov/
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
