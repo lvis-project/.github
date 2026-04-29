@@ -13,11 +13,7 @@ concurrency:
   cancel-in-progress: true
 jobs:
   build-test:
-    strategy:
-      matrix:
-        os: [ubuntu-latest, windows-latest]
-      fail-fast: false
-    runs-on: ${{ matrix.os }}
+    runs-on: [self-hosted, linux, arm64, oracle]
     permissions:
       contents: read
     steps:
