@@ -15,7 +15,7 @@ jobs:
   build-test:
     runs-on: [self-hosted, linux, arm64, oracle]
     env:
-      BUN_INSTALL: ${{ runner.temp }}/.bun
+      BUN_INSTALL: /tmp/lvis-bun-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.job }}
     permissions:
       contents: read
     steps:
