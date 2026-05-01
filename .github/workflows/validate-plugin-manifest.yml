@@ -34,3 +34,53 @@ jobs:
             -d ${{ inputs.manifest-path }} \
             --spec=draft7 \
             --strict=false
+      # Informational drift detector — surfaces when source plugin.json
+      # version is at or below the marketplace catalog's latest_stable_version.
+      # Doesn't fail the workflow; the publish.yml tag-vs-source check is the
+      # actual release-blocker. This step exists to prompt the next merger to
+      # bump source so future tag pushes don't fail at release time.
+      - name: Check version drift vs marketplace catalog
+        shell: bash
+        env:
+          MANIFEST_PATH: ${{ inputs.manifest-path }}
+        run: |
+          set -u
+          SLUG=$(node -e 'process.stdout.write(require("./" + process.env.MANIFEST_PATH).id || "")') || SLUG=""
+          SRC_VER=$(node -e 'process.stdout.write(require("./" + process.env.MANIFEST_PATH).version || "")') || SRC_VER=""
+          if [ -z "$SLUG" ] || [ -z "$SRC_VER" ]; then
+            echo "::warning::could not read plugin.json id/version — skipping drift check"
+            exit 0
+          fi
+          CATALOG=$(curl -sS "https://marketplace.lvisai.xyz/api/v1/catalog" || echo "[]")
+          export SLUG
+          CAT_VER=$(printf '%s' "$CATALOG" | python3 -c '
+          import json, sys, os
+          try:
+              items = json.load(sys.stdin)
+          except Exception:
+              sys.exit(0)
+          slug = os.environ.get("SLUG", "")
+          for p in items:
+              if p.get("slug") == slug:
+                  print(p.get("latest_stable_version", ""))
+                  break
+          ')
+          if [ -z "$CAT_VER" ]; then
+            echo "Plugin $SLUG not yet in marketplace — first publish."
+            exit 0
+          fi
+          export SRC_VER CAT_VER
+          DRIFT=$(python3 -c '
+          import os, re
+          rx = re.compile(r"^(\d+)\.(\d+)\.(\d+)$")
+          def parse(v):
+              m = rx.match(v)
+              return tuple(int(x) for x in m.groups()) if m else None
+          s, c = parse(os.environ["SRC_VER"]), parse(os.environ["CAT_VER"])
+          print("drift" if (s is not None and c is not None and s <= c) else "ok")
+          ')
+          if [ "$DRIFT" = "drift" ]; then
+            echo "::warning::source plugin.json version $SRC_VER is <= marketplace catalog latest $CAT_VER for $SLUG. Bump source above $CAT_VER before pushing the next release tag — publish.yml's tag-vs-source check will otherwise fail."
+          else
+            echo "Source $SRC_VER > catalog $CAT_VER for $SLUG — no drift."
+          fi
