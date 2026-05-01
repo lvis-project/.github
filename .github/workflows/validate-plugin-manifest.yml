@@ -1,0 +1,36 @@
+name: Validate Plugin Manifest
+on:
+  workflow_call:
+    inputs:
+      sdk-ref:
+        description: 'SDK git ref to fetch schema from (tag or branch)'
+        type: string
+        default: 'main'
+      manifest-path:
+        description: 'Path to plugin.json relative to repo root'
+        type: string
+        default: 'plugin.json'
+
+jobs:
+  validate:
+    runs-on: [self-hosted, linux, arm64, oracle]
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+      - name: Checkout SDK schema
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          repository: lvis-project/lvis-plugin-sdk
+          ref: ${{ inputs.sdk-ref }}
+          path: .sdk
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2.2.0
+        with:
+          bun-version: '1.1.38'
+      - name: Validate manifest
+        run: |
+          bunx -y ajv-cli@5 validate \
+            -s .sdk/schemas/plugin-manifest.schema.json \
+            -d ${{ inputs.manifest-path }} \
+            --spec=draft7 \
+            --strict=false
