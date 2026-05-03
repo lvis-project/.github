@@ -10,9 +10,10 @@ name: actionlint
 # expression parser catches this class of bug at PR review time
 # instead of post-merge tag-push.
 #
-# Coverage: `marketplace-publish.yml`, `plugin-ci.yml`, and
-# `validate-plugin-manifest.yml` — the three reusable workflows
-# this repo owns.
+# Coverage: `marketplace-publish.yml`, `plugin-ci.yml`,
+# `validate-plugin-manifest.yml` (the three reusable workflows this
+# repo owns) plus this `actionlint.yml` itself — actionlint
+# auto-discovers all `.github/workflows/*.yml` from the repo root.
 #
 # Self-hosted runner labels (`oracle`, ...) are whitelisted
 # in `.github/actionlint.yaml` so the linter doesn't flag them as
@@ -22,6 +23,9 @@ on:
   pull_request:
   push:
     branches: [main]
+
+permissions:
+  contents: read
 
 jobs:
   lint:
@@ -33,9 +37,11 @@ jobs:
         # Use the upstream installer script (rhysd/actionlint owner-
         # maintained) rather than a third-party wrapper action — keeps
         # the supply chain to one source of truth + a known-version
-        # binary. Pinned via the script's first arg.
+        # binary. Both the script ref AND the binary version are
+        # pinned to v1.7.12 — `main` would let upstream silently
+        # rewrite the installer between runs.
         run: |
-          curl -sL https://raw.githubusercontent.com/rhysd/actionlint/main/scripts/download-actionlint.bash \
+          curl -sL https://raw.githubusercontent.com/rhysd/actionlint/v1.7.12/scripts/download-actionlint.bash \
             | bash -s -- 1.7.12
           ./actionlint -version
 
