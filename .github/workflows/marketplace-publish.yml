@@ -191,6 +191,10 @@ jobs:
         #   protection — see "tag commit reachable from origin/main"
         #   step above.
         run: |
+          # shellcheck disable=SC2016
+          # SC2016 false positive — `$` inside the single-quoted
+          # `node -e '...'` body is JS regex anchor (`/.../`) and
+          # `process.env.X` access, not shell variable interpolation.
           node -e '
             const fs = require("node:fs");
             const path = require("node:path");

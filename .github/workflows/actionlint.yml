@@ -1,0 +1,53 @@
+name: actionlint
+#
+# Lints all workflow files in this repo on every PR + push to main.
+#
+# Why: today's marketplace-publish.yml had an `${{ }}` literal inside
+# a shell `#` comment that GitHub Actions evaluated as an empty
+# expression, failing the workflow at load-time with
+# `referenced_workflows: []` — a frustrating "0 jobs ran" failure
+# mode that took 4 canary attempts to diagnose. `actionlint`'s
+# expression parser catches this class of bug at PR review time
+# instead of post-merge tag-push.
+#
+# Coverage: `marketplace-publish.yml`, `plugin-ci.yml`,
+# `validate-plugin-manifest.yml` (the three reusable workflows this
+# repo owns) plus this `actionlint.yml` itself — actionlint
+# auto-discovers all `.github/workflows/*.yml` from the repo root.
+#
+# Self-hosted runner labels (`oracle`, ...) are whitelisted
+# in `.github/actionlint.yaml` so the linter doesn't flag them as
+# unknown.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install actionlint
+        # Use the upstream installer script (rhysd/actionlint owner-
+        # maintained) rather than a third-party wrapper action — keeps
+        # the supply chain to one source of truth + a known-version
+        # binary. Both the script ref AND the binary version are
+        # pinned to v1.7.12 — `main` would let upstream silently
+        # rewrite the installer between runs.
+        run: |
+          curl -sL https://raw.githubusercontent.com/rhysd/actionlint/v1.7.12/scripts/download-actionlint.bash \
+            | bash -s -- 1.7.12
+          ./actionlint -version
+
+      - name: Run actionlint
+        # `-no-color` for cleaner CI logs (actionlint's flag is
+        # boolean-style, not `-color=never`).
+        # actionlint auto-discovers `.github/actionlint.yaml` for
+        # self-hosted runner label whitelisting.
+        run: ./actionlint -no-color
