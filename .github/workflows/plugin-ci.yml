@@ -60,3 +60,37 @@ jobs:
           if grep -q '"test"' package.json; then bun run test; else echo "no test script — skipping"; fi
       - name: Build
         run: bun run build
+      - name: Artifact-load smoke (dist/hostPlugin.js imports without throwing)
+        # `bun run build` only checks that the bundler can produce output —
+        # it does NOT verify the bundle actually loads at runtime. esbuild's
+        # ESM emit silently inserts a runtime-throwing fallback shim for
+        # dynamic `require()` calls inside bundled CJS deps (node-ical,
+        # chokidar, msal-node, etc.); the build "succeeds" but `import()`
+        # of the artifact throws "Dynamic require of \"fs\" is not supported"
+        # the first time a dep tries to require something at module load.
+        #
+        # This step does the smallest possible runtime check: dynamic-import
+        # the produced `dist/hostPlugin.js` from a bare Node process.
+        # Throwing here catches every variant of the regression
+        # (`Dynamic require of …`, `__filename is not defined`, missing
+        # exports, native-binding load failures, …) BEFORE merge.
+        #
+        # Skipped silently when the entry isn't there — some plugins emit
+        # to a different path or via custom build scripts. The presence
+        # check keeps this step from breaking those repos when reusable
+        # workflow rolls out.
+        shell: bash
+        run: |
+          if [ ! -f dist/hostPlugin.js ]; then
+            echo "no dist/hostPlugin.js — skipping artifact smoke"
+            exit 0
+          fi
+          node --input-type=module -e "
+            import('./dist/hostPlugin.js').then((m) => {
+              const keys = Object.keys(m);
+              console.log('artifact-load OK — exports:', keys.length ? keys.join(', ') : '(none)');
+            }).catch((e) => {
+              console.error('artifact-load FAIL:', e && e.message || e);
+              process.exit(1);
+            });
+          "
