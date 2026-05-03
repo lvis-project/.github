@@ -46,7 +46,8 @@ jobs:
           ./actionlint -version
 
       - name: Run actionlint
-        # `-color=never` for cleaner CI logs.
+        # `-no-color` for cleaner CI logs (actionlint's flag is
+        # boolean-style, not `-color=never`).
         # actionlint auto-discovers `.github/actionlint.yaml` for
         # self-hosted runner label whitelisting.
-        run: ./actionlint -color=never
+        run: ./actionlint -no-color
