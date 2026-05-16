@@ -47,7 +47,7 @@ jobs:
     env:
       BUN_INSTALL: /tmp/lvis-bun-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.job }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           # Need full history so `git merge-base --is-ancestor` can verify the
           # tagged commit is reachable from origin/main.
