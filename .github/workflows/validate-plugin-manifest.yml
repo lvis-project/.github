@@ -138,3 +138,97 @@ jobs:
             exit 1
           fi
           echo "✓ version bumped $BASE_VER → $HEAD_VER"
+
+      # Enforce: any dist-affecting SOURCE change on a PR MUST bump version.
+      # The plugin.json-only guard above misses the more common case: src/** (or
+      # package.json) changes that alter the built dist, merged without touching
+      # plugin.json. The marketplace only republishes on a NEW version, so the
+      # live catalog keeps serving the stale artifact built from the old source —
+      # exactly how local-indexer / meeting / work-assistant ended up with stale
+      # published builds under unchanged version labels. dist/ is gitignored and
+      # built in CI, so the source files are the dist-affecting signal. We exclude
+      # test/doc/CI-only changes (they don't affect the published dist) to avoid
+      # false-positive friction.
+      - name: Require version bump when dist-affecting source changes (PR)
+        if: ${{ github.event_name == 'pull_request' }}
+        shell: bash
+        env:
+          MANIFEST_PATH: ${{ inputs.manifest-path }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -uo pipefail
+          # The PR checkout is shallow on the merge ref; fetch the base commit so
+          # its tree (and the diff range against HEAD) is available.
+          git fetch --no-tags --depth=1 origin "$BASE_SHA" 2>/dev/null \
+            || git fetch --no-tags origin "$BASE_SHA"
+          # Classify changed paths between base and the PR head.
+          CHANGED=$(git diff --name-only "$BASE_SHA"..HEAD)
+          if [ -z "$CHANGED" ]; then
+            echo "No file changes detected vs base — source-bump guard not applicable."
+            exit 0
+          fi
+          # A path is dist-affecting when it is under src/** (excluding test files)
+          # or is package.json (excluding lockfile-only changes). Everything else
+          # (tests, docs, CI, lockfiles) does not change the published dist.
+          DIST_AFFECTING=$(CHANGED="$CHANGED" python3 -c '
+          import os, re
+          paths = [p for p in os.environ["CHANGED"].splitlines() if p]
+          test_rx = [
+              re.compile(r"(^|/)__tests__/"),
+              re.compile(r"\.test\.[^/]+$"),
+              re.compile(r"\.spec\.[^/]+$"),
+              re.compile(r"(^|/)test/"),
+              re.compile(r"(^|/)tests/"),
+          ]
+          def is_test(p):
+              return any(rx.search(p) for rx in test_rx)
+          hits = []
+          for p in paths:
+              if p.startswith("src/") and not is_test(p):
+                  hits.append(p)
+              elif p == "package.json":
+                  hits.append(p)
+          # package-lock.json / bun.lockb / yarn.lock are lockfile-only — never
+          # dist-affecting on their own (they are filtered out by not matching above).
+          print("\n".join(hits))
+          ')
+          if [ -z "$DIST_AFFECTING" ]; then
+            echo "No dist-affecting source changes (only tests/docs/CI/lockfile) — source-bump guard not applicable."
+            exit 0
+          fi
+          echo "Dist-affecting source changed:"
+          while IFS= read -r p; do
+            [ -n "$p" ] && echo "  - $p"
+          done <<< "$DIST_AFFECTING"
+          # Read base + head versions. If plugin.json is new in this PR there is no
+          # prior version to compare; HEAD must still have a version for publish.
+          if git cat-file -e "$BASE_SHA:$MANIFEST_PATH" 2>/dev/null; then
+            BASE_VER=$(git show "$BASE_SHA:$MANIFEST_PATH" \
+              | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{process.stdout.write(String(JSON.parse(s).version||""))}catch{process.stdout.write("")}})')
+          else
+            BASE_VER=""
+          fi
+          HEAD_VER=$(node -e 'process.stdout.write(String(require("./"+process.env.MANIFEST_PATH).version||""))')
+          echo "Source changed: base version '$BASE_VER' → head version '$HEAD_VER'"
+          if [ -z "$HEAD_VER" ]; then
+            echo "::error::could not read head $MANIFEST_PATH version"
+            exit 1
+          fi
+          if [ -z "$BASE_VER" ]; then
+            echo "✓ $MANIFEST_PATH is new in this PR (head version $HEAD_VER) — first publish, source-bump guard satisfied."
+            exit 0
+          fi
+          GREATER=$(BASE_VER="$BASE_VER" HEAD_VER="$HEAD_VER" python3 -c '
+          import os, re
+          rx = re.compile(r"^(\d+)\.(\d+)\.(\d+)$")
+          def parse(v):
+              m = rx.match(v or "")
+              return tuple(int(x) for x in m.groups()) if m else None
+          b, h = parse(os.environ["BASE_VER"]), parse(os.environ["HEAD_VER"])
+          print("yes" if (b is not None and h is not None and h > b) else "no")
+          ')
+          if [ "$GREATER" != "yes" ]; then
+            echo "::error::source changed but version not bumped (base=$BASE_VER head=$HEAD_VER) → the published build would go stale; bump version so the marketplace republishes."
+            exit 1
+          fi
+          echo "✓ source changed and version bumped $BASE_VER → $HEAD_VER"
