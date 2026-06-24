@@ -84,3 +84,57 @@ jobs:
           else
             echo "Source $SRC_VER > catalog $CAT_VER for $SLUG — no drift."
           fi
+
+      # Enforce: any in-place plugin.json change on a PR MUST bump version.
+      # A manifest whose content changed on main without a version bump never
+      # gets republished (the marketplace only republishes a NEW version), so
+      # the live catalog keeps serving the old artifact — exactly what broke
+      # lge-api / ms-graph loading after the auth-out-of-tools refactor landed
+      # without a bump. The publish gate only fires on tag push; this catches
+      # the omission at PR time and forces the bump that triggers a republish.
+      - name: Require version bump when plugin.json changes (PR)
+        if: ${{ github.event_name == 'pull_request' }}
+        shell: bash
+        env:
+          MANIFEST_PATH: ${{ inputs.manifest-path }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -uo pipefail
+          # The default checkout is shallow on the PR merge ref, so the base
+          # commit's tree is not present — fetch it to read the prior manifest.
+          git fetch --no-tags --depth=1 origin "$BASE_SHA" 2>/dev/null \
+            || git fetch --no-tags origin "$BASE_SHA"
+          if ! git cat-file -e "$BASE_SHA:$MANIFEST_PATH" 2>/dev/null; then
+            echo "$MANIFEST_PATH is new in this PR — no prior version to compare; skipping."
+            exit 0
+          fi
+          if git diff --quiet "$BASE_SHA" -- "$MANIFEST_PATH"; then
+            echo "$MANIFEST_PATH unchanged vs base — version-bump guard not applicable."
+            exit 0
+          fi
+          BASE_VER=$(git show "$BASE_SHA:$MANIFEST_PATH" \
+            | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{process.stdout.write(String(JSON.parse(s).version||""))}catch{process.stdout.write("")}})')
+          HEAD_VER=$(node -e 'process.stdout.write(String(require("./"+process.env.MANIFEST_PATH).version||""))')
+          echo "$MANIFEST_PATH changed: base version '$BASE_VER' → head version '$HEAD_VER'"
+          if [ -z "$HEAD_VER" ]; then
+            echo "::error::could not read head $MANIFEST_PATH version"
+            exit 1
+          fi
+          if [ "$BASE_VER" = "$HEAD_VER" ]; then
+            echo "::error::$MANIFEST_PATH changed but version was not bumped (still $HEAD_VER). Bump the version — the marketplace only republishes on a new version, and a stale published manifest is what broke lge-api/ms-graph loading."
+            exit 1
+          fi
+          GREATER=$(BASE_VER="$BASE_VER" HEAD_VER="$HEAD_VER" python3 -c '
+          import os, re
+          rx = re.compile(r"^(\d+)\.(\d+)\.(\d+)$")
+          def parse(v):
+              m = rx.match(v or "")
+              return tuple(int(x) for x in m.groups()) if m else None
+          b, h = parse(os.environ["BASE_VER"]), parse(os.environ["HEAD_VER"])
+          print("yes" if (b is not None and h is not None and h > b) else "no")
+          ')
+          if [ "$GREATER" != "yes" ]; then
+            echo "::error::$MANIFEST_PATH version must strictly increase (base=$BASE_VER head=$HEAD_VER)."
+            exit 1
+          fi
+          echo "✓ version bumped $BASE_VER → $HEAD_VER"
