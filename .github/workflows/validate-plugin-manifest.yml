@@ -89,8 +89,8 @@ jobs:
       # A manifest whose content changed on main without a version bump never
       # gets republished (the marketplace only republishes a NEW version), so
       # the live catalog keeps serving the old artifact — exactly what broke
-      # lge-api / ms-graph loading after the auth-out-of-tools refactor landed
-      # without a bump. The publish gate only fires on tag push; this catches
+      # two intranet plugins' loading after the auth-out-of-tools refactor
+      # landed without a bump. The publish gate only fires on tag push; this catches
       # the omission at PR time and forces the bump that triggers a republish.
       - name: Require version bump when plugin.json changes (PR)
         if: ${{ github.event_name == 'pull_request' }}
@@ -121,7 +121,7 @@ jobs:
             exit 1
           fi
           if [ "$BASE_VER" = "$HEAD_VER" ]; then
-            echo "::error::$MANIFEST_PATH changed but version was not bumped (still $HEAD_VER). Bump the version — the marketplace only republishes on a new version, and a stale published manifest is what broke lge-api/ms-graph loading."
+            echo "::error::$MANIFEST_PATH changed but version was not bumped (still $HEAD_VER). Bump the version — the marketplace only republishes on a new version, and a stale published manifest is what broke two intranet plugins' loading."
             exit 1
           fi
           GREATER=$(BASE_VER="$BASE_VER" HEAD_VER="$HEAD_VER" python3 -c '
