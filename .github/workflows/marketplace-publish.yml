@@ -45,7 +45,7 @@ on:
 
 jobs:
   publish:
-    runs-on: [self-hosted, linux, arm64, oracle]
+    runs-on: ubuntu-latest
     permissions:
       contents: read
     env:
