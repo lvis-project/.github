@@ -147,7 +147,6 @@ jobs:
           RELEASE_TAG: ${{ inputs.tag }}
         run: |
           set -euo pipefail
-          git fetch origin main --quiet
           if [ "$(git cat-file -t "refs/tags/$RELEASE_TAG" 2>/dev/null || true)" != "tag" ]; then
             echo "::error::$RELEASE_TAG must be an annotated tag"
             exit 1
