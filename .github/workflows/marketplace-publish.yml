@@ -9,11 +9,11 @@ name: marketplace-publish (reusable)
 # `uses: lvis-project/.github/.github/workflows/marketplace-publish.yml@vN`
 # reference in their thin caller workflow.
 #
-# Trigger model: a SemVer git tag (`vMAJOR.MINOR.PATCH`) is the **single
-# source of truth** for a release. The plugin author bumps `plugin.json`'s
-# `version` field, lands it on `main`, and pushes a matching tag — that
-# tag-push is the only thing the caller workflows listen to. Branch pushes
-# do NOT publish.
+# Trigger model: a SemVer annotated tag (`vMAJOR.MINOR.PATCH`) is the single
+# source of truth for a release. A thin caller dispatches this workflow only
+# from its default branch and passes the tag explicitly. This trusted workflow
+# checks out that candidate without credentials, proves its exact peeled commit
+# belongs to `origin/main`, and only then executes candidate build code.
 #
 # This replaces the previous flow where `bump_version.py` derived the
 # next version from `marketplace catalog + 1` inside CI. That made the
@@ -29,6 +29,10 @@ on:
     inputs:
       slug:
         description: "Plugin slug (catalog id, e.g. 'meeting', 'local-indexer'). Must equal plugin.json.id."
+        type: string
+        required: true
+      tag:
+        description: "Existing annotated vMAJOR.MINOR.PATCH tag to publish."
         type: string
         required: true
     secrets:
@@ -51,7 +55,9 @@ jobs:
         with:
           # Need full history so `git merge-base --is-ancestor` can verify the
           # tagged commit is reachable from origin/main.
+          ref: ${{ inputs.tag }}
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Setup Node
         uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
@@ -65,21 +71,19 @@ jobs:
         # `plugin.json`'s `version` field. Mismatch fails fast.
         env:
           PLUGIN_SLUG: ${{ inputs.slug }}
+          RELEASE_TAG: ${{ inputs.tag }}
         run: |
-          if [[ "$GITHUB_REF" != refs/tags/v* ]]; then
-            echo "::error::publish must be triggered from a v*.*.* tag (got $GITHUB_REF). To release, bump plugin.json's version on main, then 'git tag vX.Y.Z && git push origin vX.Y.Z'."
+          set -euo pipefail
+          if [[ ! "$RELEASE_TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "::error::tag must be vMAJOR.MINOR.PATCH SemVer with no leading zeros (got $RELEASE_TAG)"
             exit 1
           fi
-          TAG_VER="${GITHUB_REF#refs/tags/v}"
+          TAG_VER="${RELEASE_TAG#v}"
           # Strict SemVer regex — rejects v..  / v1.2.foo / v1.2.3-rc1 etc.
           # Each component disallows leading zeros per SemVer §2 (`01.2.3`
           # would otherwise be a distinct catalog entry from `1.2.3`).
           # Pre-release tags need explicit support (and a separate channel
           # decision); for now stable-only.
-          if ! [[ "$TAG_VER" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
-            echo "::error::tag must be vMAJOR.MINOR.PATCH SemVer with no leading zeros (got v$TAG_VER)"
-            exit 1
-          fi
           # Type-strict manifest version read. Without this, a non-string
           # `version` (null/numeric/object) would silently coerce to "" via
           # `|| ""` and surface as a misleading "missing version" error.
@@ -125,7 +129,7 @@ jobs:
           echo "Publishing $PLUGIN_SLUG @ $TAG_VER"
           echo "PLUGIN_VERSION=$TAG_VER" >> "$GITHUB_ENV"
 
-      - name: Verify tag commit is reachable from origin/main
+      - name: Verify annotated tag and main ancestry
         # Defense-in-depth: only allow tags that point at main-merged commits.
         # Stops `git tag v9.9.9 <off-main-sha> && git push --tags` from
         # publishing arbitrary repo history. Cheap reachability check on the
@@ -139,12 +143,25 @@ jobs:
         # assumes that gate is in place; re-verify with
         # `gh api repos/.../branches/main/protection` if branch protection
         # configuration changes.
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
         run: |
+          set -euo pipefail
           git fetch origin main --quiet
-          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
-            echo "::error::tag commit $GITHUB_SHA is not reachable from origin/main — only main-merged commits may be released"
+          if [ "$(git cat-file -t "refs/tags/$RELEASE_TAG" 2>/dev/null || true)" != "tag" ]; then
+            echo "::error::$RELEASE_TAG must be an annotated tag"
             exit 1
           fi
+          candidate_sha="$(git rev-parse "$RELEASE_TAG^{commit}")"
+          if [ "$(git rev-parse HEAD)" != "$candidate_sha" ]; then
+            echo "::error::checked-out HEAD does not match peeled $RELEASE_TAG commit"
+            exit 1
+          fi
+          if ! git merge-base --is-ancestor "$candidate_sha" origin/main; then
+            echo "::error::tag commit $candidate_sha is not reachable from origin/main — only main-merged commits may be released"
+            exit 1
+          fi
+          echo "CANDIDATE_SHA=$candidate_sha" >> "$GITHUB_ENV"
 
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2.2.0
         with:
@@ -318,9 +335,9 @@ jobs:
           PLUGIN_SLUG: ${{ inputs.slug }}
           # Tag-push events have no head_commit; reach for the tagged commit's
           # message via git so the marketplace audit chip still gets real data.
-          COMMIT_URL: ${{ format('{0}/{1}/commit/{2}', github.server_url, github.repository, github.sha) }}
+          COMMIT_URL: ${{ format('{0}/{1}/commit/{2}', github.server_url, github.repository, env.CANDIDATE_SHA) }}
         run: |
-          COMMIT_MESSAGE="$(git log -1 --pretty=%B "${{ github.sha }}")"
+          COMMIT_MESSAGE="$(git log -1 --pretty=%B "$CANDIDATE_SHA")"
           # File list comes from stdin via `zip -@` — see the resolver
           # step above for the security rationale (no `<expr>` shell
           # injection sink, names with whitespace / quotes safe).
@@ -345,7 +362,7 @@ jobs:
           response="$(mktemp)"
           status=$(curl -sS -o "$response" -w "%{http_code}" -X POST "${MARKETPLACE_BASE_URL}/api/v1/plugins/${PLUGIN_SLUG}/versions" \
             -H "Authorization: Bearer ${MARKETPLACE_API_KEY}" \
-            -F "commit_hash=${{ github.sha }}" \
+            -F "commit_hash=$CANDIDATE_SHA" \
             --form-string "commit_message=$COMMIT_MESSAGE" \
             -F "commit_url=$COMMIT_URL" \
             -F "file=@plugin.zip")
@@ -370,7 +387,7 @@ jobs:
 
       - name: Verify idempotent 409 against catalog commit_hash
         # Compares the catalog's `latest_commit_hash` for this slug against
-        # the workflow's `${{ github.sha }}` to distinguish a benign
+        # the workflow's verified candidate SHA to distinguish a benign
         # idempotent retry from a malicious tag rewrite. Fail-closed: any
         # case where the catalog doesn't surface a matching `commit_hash`
         # for our PLUGIN_VERSION (slug missing, latest is a different
@@ -422,8 +439,8 @@ jobs:
             echo "::error::tag v${PLUGIN_VERSION} matches catalog latest but commit_hash not surfaced — refusing to silently succeed"
             exit 1
           fi
-          if [ "$catalog_sha" != "${{ github.sha }}" ]; then
-            echo "::error::tag v${PLUGIN_VERSION} was already published from $catalog_sha — refusing silent re-publish from ${{ github.sha }}. Bump plugin.json + use a new tag."
+          if [ "$catalog_sha" != "$CANDIDATE_SHA" ]; then
+            echo "::error::tag v${PLUGIN_VERSION} was already published from $catalog_sha — refusing silent re-publish from $CANDIDATE_SHA. Bump plugin.json + use a new tag."
             exit 1
           fi
           echo "Idempotent retry — catalog already holds v${PLUGIN_VERSION} from matching sha ${catalog_sha}"
