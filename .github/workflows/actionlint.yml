@@ -31,7 +31,9 @@ jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
 
       - name: Install actionlint
         # Use the upstream installer script (rhysd/actionlint owner-
@@ -41,7 +43,7 @@ jobs:
         # pinned to v1.7.12 — `main` would let upstream silently
         # rewrite the installer between runs.
         run: |
-          curl -sL https://raw.githubusercontent.com/rhysd/actionlint/v1.7.12/scripts/download-actionlint.bash \
+          curl -sL https://raw.githubusercontent.com/rhysd/actionlint/914e7df21a07ef503a81201c76d2b11c789d3fca/scripts/download-actionlint.bash \
             | bash -s -- 1.7.12
           ./actionlint -version
 
@@ -51,3 +53,155 @@ jobs:
         # actionlint auto-discovers `.github/actionlint.yaml` for
         # self-hosted runner label whitelisting.
         run: ./actionlint -no-color
+
+      - name: Verify marketplace publication isolation contract
+        run: |
+          node <<'NODE'
+          const fs = require("node:fs");
+          const source = fs.readFileSync(
+            ".github/workflows/marketplace-publish.yml",
+            "utf8",
+          );
+          const buildStart = source.indexOf("\n  build:");
+          const publishStart = source.indexOf("\n  publish:");
+          if (buildStart < 0 || publishStart <= buildStart) {
+            throw new Error("build and publish must remain separate jobs");
+          }
+          const build = source.slice(buildStart, publishStart);
+          const publish = source.slice(publishStart);
+          if (!build.includes("bun run build")) {
+            throw new Error("candidate build gate is missing");
+          }
+          if (/\$\{\{\s*secrets\./.test(build)) {
+            throw new Error("candidate build job must remain secret-free");
+          }
+          if (!build.includes("actions/upload-artifact@")) {
+            throw new Error("candidate package handoff is missing");
+          }
+          if (!/outputs:\s*\n\s+candidate_sha:\s*\$\{\{\s*steps\.provenance\.outputs\.candidate_sha\s*\}\}\s*\n\s+package_sha256:\s*\$\{\{\s*steps\.package\.outputs\.package_sha256\s*\}\}/.test(build)) {
+            throw new Error("build job must expose candidate SHA and package SHA-256");
+          }
+          if (!build.includes('echo "candidate_sha=$candidate_sha" >> "$GITHUB_OUTPUT"')) {
+            throw new Error("peeled candidate SHA must be bound to the build output");
+          }
+          if (!build.includes('echo "package_sha256=$package_sha256" >> "$GITHUB_OUTPUT"')) {
+            throw new Error("packaged artifact SHA-256 must be bound to the build output");
+          }
+          if (!publish.includes("actions/download-artifact@")) {
+            throw new Error("isolated publication handoff is missing");
+          }
+          if (publish.includes("bun install") || publish.includes("bun run build")) {
+            throw new Error("secret-bearing job must never execute candidate code");
+          }
+          if (/const\s+\w+\s*=\s*require\(["']\.\/plugin\.json["']\)/.test(publish)) {
+            throw new Error("secret-bearing job must never module-load candidate manifest paths");
+          }
+          for (const guard of [
+            "fs.lstatSync(manifestPath)",
+            "stat.isSymbolicLink()",
+            "!stat.isFile()",
+            'JSON.parse(fs.readFileSync(manifestPath, "utf8"))',
+            "realPath !== manifestPath",
+          ]) {
+            if (!publish.includes(guard)) {
+              throw new Error(`candidate manifest guard is missing: ${guard}`);
+            }
+          }
+          const expressionOpen = "$" + "{{";
+          if (!publish.includes(`EXPECTED_CANDIDATE_SHA: ${expressionOpen} needs.build.outputs.candidate_sha }}`)) {
+            throw new Error("publish job must consume the exact build candidate SHA");
+          }
+          if (!publish.includes('[ "$candidate_sha" != "$EXPECTED_CANDIDATE_SHA" ]')) {
+            throw new Error("publish job must reject a moved tag");
+          }
+          if (!publish.includes(`EXPECTED_PACKAGE_SHA256: ${expressionOpen} needs.build.outputs.package_sha256 }}`)) {
+            throw new Error("publish job must consume the exact build package SHA-256");
+          }
+          if (!publish.includes('[ "$actual_package_sha256" != "$EXPECTED_PACKAGE_SHA256" ]')) {
+            throw new Error("publish job must reject a changed package");
+          }
+          const firstSecret = publish.indexOf(`${expressionOpen} secrets.`);
+          const candidateBinding = publish.indexOf('[ "$candidate_sha" != "$EXPECTED_CANDIDATE_SHA" ]');
+          const packageBinding = publish.indexOf('[ "$actual_package_sha256" != "$EXPECTED_PACKAGE_SHA256" ]');
+          if (
+            firstSecret < 0 ||
+            candidateBinding < 0 ||
+            packageBinding < 0 ||
+            candidateBinding > firstSecret ||
+            packageBinding > firstSecret
+          ) {
+            throw new Error("candidate and package provenance must be verified before any secret is exposed");
+          }
+          if (!/MARKETPLACE_API_KEY:\s*\$\{\{\s*secrets\.MARKETPLACE_API_KEY\s*\}\}/.test(publish)) {
+            throw new Error("publish secret must remain step-scoped");
+          }
+          const actionRefs = [...source.matchAll(/^\s*-?\s*uses:\s+([^@\s]+)@([^\s#]+)/gm)]
+            .map((match) => ({ action: match[1], ref: match[2] }));
+          if (actionRefs.length !== 7) {
+            throw new Error(`expected all 7 action uses to be audited, got ${actionRefs.length}`);
+          }
+          if (actionRefs.some(({ ref }) => !/^[0-9a-f]{40}$/.test(ref))) {
+            throw new Error("all reusable workflow actions must use exact SHAs");
+          }
+          const expectedActionCounts = new Map([
+            ["actions/checkout", 2],
+            ["actions/setup-node", 2],
+            ["oven-sh/setup-bun", 1],
+            ["actions/upload-artifact", 1],
+            ["actions/download-artifact", 1],
+          ]);
+          for (const [action, expectedCount] of expectedActionCounts) {
+            const actualCount = actionRefs.filter((entry) => entry.action === action).length;
+            if (actualCount !== expectedCount) {
+              throw new Error(`expected ${expectedCount} pinned ${action} uses, got ${actualCount}`);
+            }
+          }
+
+          const readerMatch = source.match(
+            /\/\/ PUBLISH_MANIFEST_READER_START\n([\s\S]*?)\n\s*\/\/ PUBLISH_MANIFEST_READER_END/,
+          );
+          if (!readerMatch) {
+            throw new Error("publish manifest reader test markers are missing");
+          }
+          const readerScript = readerMatch[1];
+          const os = require("node:os");
+          const path = require("node:path");
+          const { spawnSync } = require("node:child_process");
+          const fixtureRoot = fs.mkdtempSync(path.join(os.tmpdir(), "publish-manifest-reader-"));
+          try {
+            const hostileDir = path.join(fixtureRoot, "hostile");
+            fs.mkdirSync(hostileDir);
+            const markerPath = path.join(hostileDir, "payload-executed");
+            fs.writeFileSync(
+              path.join(hostileDir, "payload.js"),
+              `require("node:fs").writeFileSync(${JSON.stringify(markerPath)}, "executed"); module.exports = { id: "meeting", version: "1.2.3" };`,
+            );
+            fs.symlinkSync("payload.js", path.join(hostileDir, "plugin.json"));
+            const hostile = spawnSync(process.execPath, ["-e", readerScript], {
+              cwd: hostileDir,
+              encoding: "utf8",
+            });
+            if (hostile.status === 0) {
+              throw new Error("symlinked candidate manifest must be rejected");
+            }
+            if (fs.existsSync(markerPath)) {
+              throw new Error("symlinked JavaScript payload was executed");
+            }
+
+            const normalDir = path.join(fixtureRoot, "normal");
+            fs.mkdirSync(normalDir);
+            fs.writeFileSync(
+              path.join(normalDir, "plugin.json"),
+              JSON.stringify({ id: "meeting", version: "1.2.3" }),
+            );
+            const normal = spawnSync(process.execPath, ["-e", readerScript], {
+              cwd: normalDir,
+              encoding: "utf8",
+            });
+            if (normal.status !== 0 || normal.stdout !== "meeting\n1.2.3") {
+              throw new Error(`regular JSON manifest must be accepted: ${normal.stderr}`);
+            }
+          } finally {
+            fs.rmSync(fixtureRoot, { recursive: true, force: true });
+          }
+          NODE
