@@ -6,14 +6,17 @@ name: marketplace-publish (reusable)
 # v0.1.20–0.1.21). With this single source of truth, future changes
 # to the publish pipeline (security guards, marketplace API contract,
 # zip layout) land once and propagate to every plugin via the
-# `uses: lvis-project/.github/.github/workflows/marketplace-publish.yml@vN`
-# reference in their thin caller workflow.
+# `uses: lvis-project/.github/.github/workflows/marketplace-publish.yml@<40-char-sha>`
+# reference in their thin caller workflow. Mutable branch or tag references are
+# not a supported trust boundary for secret-bearing publication.
 #
 # Trigger model: a SemVer annotated tag (`vMAJOR.MINOR.PATCH`) is the single
 # source of truth for a release. A thin caller dispatches this workflow only
 # from its default branch and passes the tag explicitly. This trusted workflow
 # checks out that candidate without credentials, proves its exact peeled commit
-# belongs to `origin/main`, and only then executes candidate build code.
+# belongs to `origin/main`, and only then executes candidate build code. The
+# candidate build and the secret-bearing upload run as separate jobs on fresh
+# GitHub-hosted runners; candidate processes never share a runner with secrets.
 #
 # This replaces the previous flow where `bump_version.py` derived the
 # next version from `marketplace catalog + 1` inside CI. That made the
@@ -44,7 +47,8 @@ on:
         required: false
 
 jobs:
-  publish:
+  build:
+    name: Build verified candidate without secrets
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -136,13 +140,9 @@ jobs:
         # full-depth checkout fetched above.
         #
         # Boundary: this check proves the tag points at a commit reachable
-        # from `origin/main` HEAD at workflow runtime. It does NOT defend
-        # against `main` itself being compromised (force-push, malicious
-        # merge, etc.). Those vectors are gated by GitHub branch protection
-        # on `main` (required reviews, force-push disabled). This workflow
-        # assumes that gate is in place; re-verify with
-        # `gh api repos/.../branches/main/protection` if branch protection
-        # configuration changes.
+        # from `origin/main` HEAD at workflow runtime. Candidate code still
+        # remains untrusted: it runs only in this secret-free build job. The
+        # later upload uses a fresh runner and never executes candidate code.
         env:
           RELEASE_TAG: ${{ inputs.tag }}
         run: |
@@ -167,15 +167,6 @@ jobs:
           bun-version: "1.3.14"
       - run: bun install --frozen-lockfile
       - run: bun run build
-
-      - name: Normalize marketplace URL
-        env:
-          MARKETPLACE_BASE_URL: ${{ secrets.MARKETPLACE_BASE_URL }}
-        run: |
-          base="${MARKETPLACE_BASE_URL:-https://marketplace.lvisai.xyz}"
-          base="${base%/}"
-          base="${base%/api/v1}"
-          echo "MARKETPLACE_BASE_URL=$base" >> "$GITHUB_ENV"
 
       - name: Resolve shippable file list from package.json:files
         id: filelist
@@ -327,16 +318,9 @@ jobs:
             }
           '
 
-      - name: Package + publish
-        id: publish
-        env:
-          MARKETPLACE_API_KEY: ${{ secrets.MARKETPLACE_API_KEY }}
-          PLUGIN_SLUG: ${{ inputs.slug }}
-          # Tag-push events have no head_commit; reach for the tagged commit's
-          # message via git so the marketplace audit chip still gets real data.
-          COMMIT_URL: ${{ format('{0}/{1}/commit/{2}', github.server_url, github.repository, env.CANDIDATE_SHA) }}
+      - name: Package verified candidate
         run: |
-          COMMIT_MESSAGE="$(git log -1 --pretty=%B "$CANDIDATE_SHA")"
+          set -euo pipefail
           # File list comes from stdin via `zip -@` — see the resolver
           # step above for the security rationale (no `<expr>` shell
           # injection sink, names with whitespace / quotes safe).
@@ -358,13 +342,128 @@ jobs:
             -x "*.netrc" \
             -x "secrets*" \
             < "$RUNNER_TEMP/artifact-files.list"
+
+      - name: Upload candidate package for isolated publication
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: marketplace-package
+          path: plugin.zip
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    name: Publish package on a fresh runner
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        with:
+          ref: ${{ inputs.tag }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Setup Node
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: "22.23.1"
+
+      - name: Reverify tag, manifest, and provenance without candidate execution
+        env:
+          PLUGIN_SLUG: ${{ inputs.slug }}
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$RELEASE_TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "::error::tag must be vMAJOR.MINOR.PATCH SemVer with no leading zeros (got $RELEASE_TAG)"
+            exit 1
+          fi
+          plugin_version="${RELEASE_TAG#v}"
+          manifest_values="$(node -e '
+            const manifest = require("./plugin.json");
+            if (typeof manifest.id !== "string" || manifest.id.length === 0) {
+              console.error("plugin.json.id must be a non-empty string");
+              process.exit(2);
+            }
+            if (typeof manifest.version !== "string" || manifest.version.length === 0) {
+              console.error("plugin.json.version must be a non-empty string");
+              process.exit(2);
+            }
+            process.stdout.write(manifest.id + "\n" + manifest.version);
+          ')"
+          manifest_id="$(printf '%s\n' "$manifest_values" | sed -n '1p')"
+          manifest_version="$(printf '%s\n' "$manifest_values" | sed -n '2p')"
+          if [ "$PLUGIN_SLUG" != "$manifest_id" ]; then
+            echo "::error::caller-provided slug '$PLUGIN_SLUG' does not match plugin.json.id '$manifest_id'"
+            exit 1
+          fi
+          if [ "$plugin_version" != "$manifest_version" ]; then
+            echo "::error::tag $RELEASE_TAG does not match plugin.json version $manifest_version"
+            exit 1
+          fi
+          if [ "$(git cat-file -t "refs/tags/$RELEASE_TAG" 2>/dev/null || true)" != "tag" ]; then
+            echo "::error::$RELEASE_TAG must be an annotated tag"
+            exit 1
+          fi
+          candidate_sha="$(git rev-parse "$RELEASE_TAG^{commit}")"
+          if [ "$(git rev-parse HEAD)" != "$candidate_sha" ]; then
+            echo "::error::checked-out HEAD does not match peeled $RELEASE_TAG commit"
+            exit 1
+          fi
+          if ! git merge-base --is-ancestor "$candidate_sha" origin/main; then
+            echo "::error::tag commit $candidate_sha is not reachable from origin/main"
+            exit 1
+          fi
+          {
+            echo "PLUGIN_VERSION=$plugin_version"
+            echo "CANDIDATE_SHA=$candidate_sha"
+          } >> "$GITHUB_ENV"
+
+      - name: Download package without executing candidate content
+        uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8.0.0
+        with:
+          name: marketplace-package
+          path: .publish-artifact
+
+      - name: Validate isolated package handoff
+        run: |
+          set -euo pipefail
+          test -f .publish-artifact/plugin.zip
+          test ! -L .publish-artifact/plugin.zip
+          if [ "$(find .publish-artifact -mindepth 1 -maxdepth 1 -type f | wc -l | tr -d ' ')" != "1" ]; then
+            echo "::error::isolated publication expects exactly one regular artifact"
+            exit 1
+          fi
+          sha256sum .publish-artifact/plugin.zip
+
+      - name: Normalize marketplace URL
+        env:
+          MARKETPLACE_BASE_URL: ${{ secrets.MARKETPLACE_BASE_URL }}
+        run: |
+          set -euo pipefail
+          base="${MARKETPLACE_BASE_URL:-https://marketplace.lvisai.xyz}"
+          base="${base%/}"
+          base="${base%/api/v1}"
+          echo "MARKETPLACE_BASE_URL=$base" >> "$GITHUB_ENV"
+
+      - name: Publish isolated package
+        id: publish
+        env:
+          MARKETPLACE_API_KEY: ${{ secrets.MARKETPLACE_API_KEY }}
+          PLUGIN_SLUG: ${{ inputs.slug }}
+        run: |
+          set -euo pipefail
+          COMMIT_MESSAGE="$(git log -1 --pretty=%B "$CANDIDATE_SHA")"
+          COMMIT_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/commit/${CANDIDATE_SHA}"
           response="$(mktemp)"
           status=$(curl -sS -o "$response" -w "%{http_code}" -X POST "${MARKETPLACE_BASE_URL}/api/v1/plugins/${PLUGIN_SLUG}/versions" \
             -H "Authorization: Bearer ${MARKETPLACE_API_KEY}" \
             -F "commit_hash=$CANDIDATE_SHA" \
             --form-string "commit_message=$COMMIT_MESSAGE" \
             -F "commit_url=$COMMIT_URL" \
-            -F "file=@plugin.zip")
+            -F "file=@.publish-artifact/plugin.zip")
           cat "$response"
           if [ "$status" = "201" ]; then
             echo "Published ${PLUGIN_SLUG} @ ${PLUGIN_VERSION}"
