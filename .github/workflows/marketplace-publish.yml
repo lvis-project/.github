@@ -52,6 +52,9 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+    outputs:
+      candidate_sha: ${{ steps.provenance.outputs.candidate_sha }}
+      package_sha256: ${{ steps.package.outputs.package_sha256 }}
     env:
       BUN_INSTALL: /tmp/lvis-bun-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.job }}
     steps:
@@ -134,6 +137,7 @@ jobs:
           echo "PLUGIN_VERSION=$TAG_VER" >> "$GITHUB_ENV"
 
       - name: Verify annotated tag and main ancestry
+        id: provenance
         # Defense-in-depth: only allow tags that point at main-merged commits.
         # Stops `git tag v9.9.9 <off-main-sha> && git push --tags` from
         # publishing arbitrary repo history. Cheap reachability check on the
@@ -161,6 +165,7 @@ jobs:
             exit 1
           fi
           echo "CANDIDATE_SHA=$candidate_sha" >> "$GITHUB_ENV"
+          echo "candidate_sha=$candidate_sha" >> "$GITHUB_OUTPUT"
 
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2.2.0
         with:
@@ -319,6 +324,7 @@ jobs:
           '
 
       - name: Package verified candidate
+        id: package
         run: |
           set -euo pipefail
           # File list comes from stdin via `zip -@` — see the resolver
@@ -342,6 +348,12 @@ jobs:
             -x "*.netrc" \
             -x "secrets*" \
             < "$RUNNER_TEMP/artifact-files.list"
+          package_sha256="$(sha256sum plugin.zip | awk '{print $1}')"
+          if [[ ! "$package_sha256" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "::error::failed to calculate candidate package SHA-256"
+            exit 1
+          fi
+          echo "package_sha256=$package_sha256" >> "$GITHUB_OUTPUT"
 
       - name: Upload candidate package for isolated publication
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -372,6 +384,7 @@ jobs:
 
       - name: Reverify tag, manifest, and provenance without candidate execution
         env:
+          EXPECTED_CANDIDATE_SHA: ${{ needs.build.outputs.candidate_sha }}
           PLUGIN_SLUG: ${{ inputs.slug }}
           RELEASE_TAG: ${{ inputs.tag }}
         run: |
@@ -381,8 +394,61 @@ jobs:
             exit 1
           fi
           plugin_version="${RELEASE_TAG#v}"
-          manifest_values="$(node -e '
-            const manifest = require("./plugin.json");
+          # `plugin.json` is candidate-controlled. Never load it through
+          # Node's module loader here: a symlink to `payload.js` makes
+          # the module loader resolve the manifest symlink and execute
+          # JavaScript on this
+          # secret-bearing runner. Validate the exact path and parse bytes as
+          # JSON instead.
+          if ! node - > "$RUNNER_TEMP/manifest-values" <<'NODE'
+          // PUBLISH_MANIFEST_READER_START
+            const fs = require("node:fs");
+            const path = require("node:path");
+
+            const root = fs.realpathSync(".");
+            const manifestPath = path.resolve(root, "plugin.json");
+            const relative = path.relative(root, manifestPath);
+            if (relative.startsWith(".." + path.sep) || path.isAbsolute(relative)) {
+              console.error("plugin.json path escapes the checked-out repository");
+              process.exit(2);
+            }
+
+            let stat;
+            try {
+              stat = fs.lstatSync(manifestPath);
+            } catch {
+              console.error("plugin.json must exist as a regular file");
+              process.exit(2);
+            }
+            if (stat.isSymbolicLink() || !stat.isFile()) {
+              console.error("plugin.json must be a regular non-symlink file");
+              process.exit(2);
+            }
+
+            let realPath;
+            try {
+              realPath = fs.realpathSync(manifestPath);
+            } catch {
+              console.error("plugin.json path must resolve without races");
+              process.exit(2);
+            }
+            const realRelative = path.relative(root, realPath);
+            if (
+              realRelative.startsWith(".." + path.sep) ||
+              path.isAbsolute(realRelative) ||
+              realPath !== manifestPath
+            ) {
+              console.error("plugin.json must resolve to the checked-out regular file");
+              process.exit(2);
+            }
+
+            let manifest;
+            try {
+              manifest = JSON.parse(fs.readFileSync(manifestPath, "utf8"));
+            } catch {
+              console.error("plugin.json must contain valid JSON");
+              process.exit(2);
+            }
             if (typeof manifest.id !== "string" || manifest.id.length === 0) {
               console.error("plugin.json.id must be a non-empty string");
               process.exit(2);
@@ -392,7 +458,13 @@ jobs:
               process.exit(2);
             }
             process.stdout.write(manifest.id + "\n" + manifest.version);
-          ')"
+          // PUBLISH_MANIFEST_READER_END
+          NODE
+          then
+            echo "::error::failed to read plugin.json as a regular JSON file"
+            exit 1
+          fi
+          manifest_values="$(cat "$RUNNER_TEMP/manifest-values")"
           manifest_id="$(printf '%s\n' "$manifest_values" | sed -n '1p')"
           manifest_version="$(printf '%s\n' "$manifest_values" | sed -n '2p')"
           if [ "$PLUGIN_SLUG" != "$manifest_id" ]; then
@@ -416,6 +488,14 @@ jobs:
             echo "::error::tag commit $candidate_sha is not reachable from origin/main"
             exit 1
           fi
+          if [[ ! "$EXPECTED_CANDIDATE_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::build job did not provide a valid candidate SHA"
+            exit 1
+          fi
+          if [ "$candidate_sha" != "$EXPECTED_CANDIDATE_SHA" ]; then
+            echo "::error::tag moved between build and publish (built $EXPECTED_CANDIDATE_SHA, now resolves to $candidate_sha)"
+            exit 1
+          fi
           {
             echo "PLUGIN_VERSION=$plugin_version"
             echo "CANDIDATE_SHA=$candidate_sha"
@@ -428,6 +508,8 @@ jobs:
           path: .publish-artifact
 
       - name: Validate isolated package handoff
+        env:
+          EXPECTED_PACKAGE_SHA256: ${{ needs.build.outputs.package_sha256 }}
         run: |
           set -euo pipefail
           test -f .publish-artifact/plugin.zip
@@ -436,7 +518,16 @@ jobs:
             echo "::error::isolated publication expects exactly one regular artifact"
             exit 1
           fi
-          sha256sum .publish-artifact/plugin.zip
+          if [[ ! "$EXPECTED_PACKAGE_SHA256" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "::error::build job did not provide a valid package SHA-256"
+            exit 1
+          fi
+          actual_package_sha256="$(sha256sum .publish-artifact/plugin.zip | awk '{print $1}')"
+          if [ "$actual_package_sha256" != "$EXPECTED_PACKAGE_SHA256" ]; then
+            echo "::error::downloaded package SHA-256 does not match the build handoff"
+            exit 1
+          fi
+          echo "Verified package SHA-256: $actual_package_sha256"
 
       - name: Normalize marketplace URL
         env:
