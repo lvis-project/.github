@@ -106,6 +106,14 @@ jobs:
           if (noProxyCalls < 3) {
             throw new Error("local origin health, publish, and catalog requests must bypass proxies");
           }
+          for (const localEndpoint of [
+            "${MARKETPLACE_ORIGIN}/api/v1/plugins/${PLUGIN_SLUG}/versions",
+            "${MARKETPLACE_ORIGIN}/api/v1/catalog",
+          ]) {
+            if (!publish.includes(localEndpoint)) {
+              throw new Error("publish job must use the fixed loopback origin for " + localEndpoint);
+            }
+          }
           if (publish.includes("bun install") || publish.includes("bun run build")) {
             throw new Error("secret-bearing job must never execute candidate code");
           }
