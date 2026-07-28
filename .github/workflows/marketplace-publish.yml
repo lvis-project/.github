@@ -15,8 +15,10 @@ name: marketplace-publish (reusable)
 # from its default branch and passes the tag explicitly. This trusted workflow
 # checks out that candidate without credentials, proves its exact peeled commit
 # belongs to `origin/main`, and only then executes candidate build code. The
-# candidate build and the secret-bearing upload run as separate jobs on fresh
-# GitHub-hosted runners; candidate processes never share a runner with secrets.
+# candidate build and the secret-bearing upload run as separate jobs. The
+# candidate build remains GitHub-hosted; the upload uses a dedicated,
+# low-privilege Marketplace publisher runner. Candidate processes never share
+# a runner with secrets.
 #
 # This replaces the previous flow where `bump_version.py` derived the
 # next version from `marketplace catalog + 1` inside CI. That made the
@@ -42,9 +44,6 @@ on:
       MARKETPLACE_API_KEY:
         description: "Bearer token for marketplace POST /versions endpoint."
         required: true
-      MARKETPLACE_BASE_URL:
-        description: "Marketplace base URL. Defaults to https://marketplace.lvisai.xyz when unset."
-        required: false
 
 jobs:
   build:
@@ -366,7 +365,12 @@ jobs:
   publish:
     name: Publish package on a fresh runner
     needs: build
-    runs-on: ubuntu-latest
+    # Only the low-privilege, loopback-connected publisher tier receives the
+    # Marketplace API key. It is intentionally not part of the generic CI or
+    # deploy runner groups.
+    runs-on:
+      group: lvis-oracle-publisher
+      labels: [self-hosted, linux, arm64, marketplace-publisher]
     permissions:
       actions: read
       contents: read
@@ -529,15 +533,13 @@ jobs:
           fi
           echo "Verified package SHA-256: $actual_package_sha256"
 
-      - name: Normalize marketplace URL
-        env:
-          MARKETPLACE_BASE_URL: ${{ secrets.MARKETPLACE_BASE_URL }}
+      - name: Bind publisher to the local Marketplace origin
         run: |
           set -euo pipefail
-          base="${MARKETPLACE_BASE_URL:-https://marketplace.lvisai.xyz}"
-          base="${base%/}"
-          base="${base%/api/v1}"
-          echo "MARKETPLACE_BASE_URL=$base" >> "$GITHUB_ENV"
+          origin="http://127.0.0.1:8000"
+          curl --noproxy '*' --fail --silent --show-error \
+            "${origin}/api/v1/health" >/dev/null
+          echo "MARKETPLACE_ORIGIN=$origin" >> "$GITHUB_ENV"
 
       - name: Publish isolated package
         id: publish
@@ -549,7 +551,7 @@ jobs:
           COMMIT_MESSAGE="$(git log -1 --pretty=%B "$CANDIDATE_SHA")"
           COMMIT_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/commit/${CANDIDATE_SHA}"
           response="$(mktemp)"
-          status=$(curl -sS -o "$response" -w "%{http_code}" -X POST "${MARKETPLACE_BASE_URL}/api/v1/plugins/${PLUGIN_SLUG}/versions" \
+          status=$(curl --noproxy '*' -sS -o "$response" -w "%{http_code}" -X POST "${MARKETPLACE_ORIGIN}/api/v1/plugins/${PLUGIN_SLUG}/versions" \
             -H "Authorization: Bearer ${MARKETPLACE_API_KEY}" \
             -F "commit_hash=$CANDIDATE_SHA" \
             --form-string "commit_message=$COMMIT_MESSAGE" \
@@ -595,8 +597,8 @@ jobs:
           PLUGIN_SLUG: ${{ inputs.slug }}
         run: |
           catalog_response=$(mktemp)
-          catalog_status=$(curl -sS -o "$catalog_response" -w "%{http_code}" \
-            "${MARKETPLACE_BASE_URL}/api/v1/catalog")
+          catalog_status=$(curl --noproxy '*' -sS -o "$catalog_response" -w "%{http_code}" \
+            "${MARKETPLACE_ORIGIN}/api/v1/catalog")
           if [ "$catalog_status" != "200" ]; then
             echo "::error::failed to GET catalog (HTTP $catalog_status) — cannot verify idempotent re-publish"
             cat "$catalog_response"

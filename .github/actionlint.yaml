@@ -1,10 +1,8 @@
 # actionlint config
 #
-# Whitelist self-hosted runner labels used by the org's runners.
-# Without this, actionlint reports "label 'oracle' is unknown" — a
-# false positive for our `[self-hosted, linux, arm64, oracle]`
-# runner pool. The other labels (self-hosted, linux, arm64) are
-# already known to actionlint.
+# Whitelist self-hosted runner labels used by the org's runners. The other
+# labels (self-hosted, linux, arm64) are already known to actionlint.
 self-hosted-runner:
   labels:
     - oracle
+    - marketplace-publisher
