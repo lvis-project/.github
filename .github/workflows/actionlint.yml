@@ -228,4 +228,15 @@ jobs:
           } finally {
             fs.rmSync(fixtureRoot, { recursive: true, force: true });
           }
-          NODE
+          for (const reusablePath of [
+            ".github/workflows/plugin-ci.yml",
+            ".github/workflows/validate-plugin-manifest.yml",
+          ]) {
+            const reusable = fs.readFileSync(reusablePath, "utf8");
+            if (!/if:\s*>-\s*\n\s+github\.event_name != 'pull_request' \|\|\s*\n\s+github\.event\.pull_request\.head\.repo\.full_name == github\.repository/.test(reusable)) {
+              throw new Error("self-hosted reusable CI must skip fork pull requests: " + reusablePath);
+            }
+            if (!/runs-on:\s*\n\s+group:\s*lvis-oracle-ci\s*\n\s+labels:\s*\[self-hosted, linux, arm64, oracle\]/.test(reusable)) {
+              throw new Error("self-hosted reusable CI must use only lvis-oracle-ci: " + reusablePath);
+            }
+          }          NODE

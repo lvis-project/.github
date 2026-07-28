@@ -13,7 +13,12 @@ concurrency:
   cancel-in-progress: true
 jobs:
   build-test:
-    runs-on: [self-hosted, linux, arm64, oracle]
+    if: >-
+      github.event_name != 'pull_request' ||
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on:
+      group: lvis-oracle-ci
+      labels: [self-hosted, linux, arm64, oracle]
     env:
       BUN_INSTALL: /tmp/lvis-bun-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.job }}
     permissions:
