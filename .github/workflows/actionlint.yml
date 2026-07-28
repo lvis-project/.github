@@ -239,4 +239,5 @@ jobs:
             if (!/runs-on:\s*\n\s+group:\s*lvis-oracle-ci\s*\n\s+labels:\s*\[self-hosted, linux, arm64, oracle\]/.test(reusable)) {
               throw new Error("self-hosted reusable CI must use only lvis-oracle-ci: " + reusablePath);
             }
-          }          NODE
+          }
+          NODE
