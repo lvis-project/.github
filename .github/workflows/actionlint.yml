@@ -15,7 +15,7 @@ name: actionlint
 # repo owns) plus this `actionlint.yml` itself — actionlint
 # auto-discovers all `.github/workflows/*.yml` from the repo root.
 #
-# Self-hosted runner labels (`oracle`, ...) are whitelisted
+# Self-hosted runner labels (`oracle`, `marketplace-publisher`, ...) are whitelisted
 # in `.github/actionlint.yaml` so the linter doesn't flag them as
 # unknown.
 
@@ -72,6 +72,9 @@ jobs:
           if (!build.includes("bun run build")) {
             throw new Error("candidate build gate is missing");
           }
+          if (!/runs-on:\s*ubuntu-latest/.test(build)) {
+            throw new Error("candidate build must remain GitHub-hosted");
+          }
           if (/\$\{\{\s*secrets\./.test(build)) {
             throw new Error("candidate build job must remain secret-free");
           }
@@ -89,6 +92,19 @@ jobs:
           }
           if (!publish.includes("actions/download-artifact@")) {
             throw new Error("isolated publication handoff is missing");
+          }
+          if (!/runs-on:\s*\n\s+group:\s*lvis-oracle-publisher\s*\n\s+labels:\s*\[self-hosted, linux, arm64, marketplace-publisher\]/.test(publish)) {
+            throw new Error("publish job must use the dedicated Marketplace publisher runner group");
+          }
+          if (source.includes("MARKETPLACE_BASE_URL")) {
+            throw new Error("caller-controlled Marketplace URLs must not be accepted");
+          }
+          if (!publish.includes('origin="http://127.0.0.1:8000"')) {
+            throw new Error("publish job must bind to the fixed loopback Marketplace origin");
+          }
+          const noProxyCalls = publish.split("curl --noproxy '*'").length - 1;
+          if (noProxyCalls < 3) {
+            throw new Error("local origin health, publish, and catalog requests must bypass proxies");
           }
           if (publish.includes("bun install") || publish.includes("bun run build")) {
             throw new Error("secret-bearing job must never execute candidate code");
