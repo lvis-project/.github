@@ -19,6 +19,12 @@ jobs:
     runs-on:
       group: lvis-oracle-ci
       labels: [self-hosted, linux, arm64, oracle]
+    # A job that no runner accepts does not error — it waits out the 24-hour
+    # queue limit with no red check anywhere. That silence is how a broken
+    # publish pipeline went unnoticed for days in 2026-08; the same shape is
+    # available to any self-hosted job, so bound it here too. This is generous
+    # for work that finishes in well under a minute.
+    timeout-minutes: 20
     permissions:
       contents: read
     steps:
