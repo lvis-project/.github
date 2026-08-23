@@ -40,6 +40,73 @@ jobs:
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020  # v7.0.0
         with:
           node-version: ${{ inputs.node-version }}
+      # Korean source read back by a CP949 decoder and written out again is
+      # destroyed, and nothing else in CI reads Korean. It happened once, in
+      # lvis-plugin-ep on 2026-05-26, inside a commit about deleting old pages:
+      # 245 lines were mangled and shipped for three months. Two were not
+      # comments — a room-alias table whose keys no user input could match, and
+      # a remote-work check comparing against a mangled literal.
+      #
+      # The damage has a fingerprint. A UTF-8 byte pair CP949 can map lands in
+      # the CJK ideograph block; one it cannot is written as '?'; and the
+      # orphaned third byte of a Hangul syllable passes through as a raw C1
+      # control character. None of those belong in a repo that writes Korean,
+      # so a line carrying one fails the build that introduces it. U+FFFD is
+      # deliberately not one of the signals: this damage never produces it, and
+      # the code that guards against a *different* decoder's output legitimately
+      # names the character.
+      #
+      # Deliberate mojibake — a detector for it, a comment documenting it —
+      # tags its line `[mojibake-sample]`. That tag is greppable, so the
+      # exemptions stay visible instead of piling up in a list here.
+      - name: Encoding gate (no CP949 mojibake in source)
+        shell: bash
+        run: |
+          cat > "$RUNNER_TEMP/encoding-gate.mjs" <<'JS'
+          import { execSync } from "node:child_process";
+          import { readFileSync } from "node:fs";
+
+          const EXTENSIONS = [".ts", ".tsx", ".js", ".mjs", ".cjs", ".json", ".md"];
+          const CJK = /[⺀-⿿㐀-䶿一-鿿豈-﫿]/;
+          const LOST = /\?[가-힣]|[가-힣]\?[가-힣]/;
+          const EXEMPT = /\[mojibake-sample\]/;
+          const hasC1 = (line) =>
+            [...line].some((ch) => ch.charCodeAt(0) >= 0x80 && ch.charCodeAt(0) <= 0x9f);
+
+          const tracked = execSync("git ls-files", { encoding: "utf8" }).split("\n");
+          const scanned = tracked.filter(
+            (file) =>
+              (/^(src|skills)\//.test(file) ||
+                file === "plugin.json" ||
+                file === "package.json") &&
+              EXTENSIONS.some((ext) => file.endsWith(ext)),
+          );
+
+          const damaged = [];
+          for (const file of scanned) {
+            readFileSync(file, "utf8")
+              .split("\n")
+              .forEach((line, index) => {
+                if (EXEMPT.test(line)) return;
+                if (CJK.test(line) || LOST.test(line) || hasC1(line)) {
+                  damaged.push(`${file}:${index + 1}: ${line.trim().slice(0, 120)}`);
+                }
+              });
+          }
+
+          if (damaged.length > 0) {
+            for (const hit of damaged) console.log(`::error::${hit}`);
+            console.log(
+              `\n${damaged.length} line(s) carry the fingerprint of a CP949 round trip.\n` +
+                "If the text is meant to look that way, tag its line [mojibake-sample].\n" +
+                "Otherwise the file was written by a tool that misread its encoding;\n" +
+                "recover the text from git history rather than retyping it.",
+            );
+            process.exit(1);
+          }
+          console.log(`encoding gate: ${scanned.length} file(s) clean`);
+          JS
+          node "$RUNNER_TEMP/encoding-gate.mjs"
       - name: Verify submodule integrity
         shell: bash
         run: |
