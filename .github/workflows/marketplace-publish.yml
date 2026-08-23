@@ -6,9 +6,21 @@ name: marketplace-publish (reusable)
 # v0.1.20–0.1.21). With this single source of truth, future changes
 # to the publish pipeline (security guards, marketplace API contract,
 # zip layout) land once and propagate to every plugin via the
-# `uses: lvis-project/.github/.github/workflows/marketplace-publish.yml@<40-char-sha>`
-# reference in their thin caller workflow. Mutable branch or tag references are
-# not a supported trust boundary for secret-bearing publication.
+# `uses: lvis-project/.github/.github/workflows/marketplace-publish.yml@main`
+# reference in their thin caller workflow.
+#
+# That reference is deliberately `@main` and not a commit SHA. A SHA there is
+# not a second lock, because the publisher runner group is workflow-restricted
+# and GitHub matches its allow-list against the exact ref the caller writes: the
+# same decision would live twice, once in a reviewed workflow file and once in
+# an org setting no pull request sees. When the two drifted in 2026-08 the
+# publish job did not fail — it queued until it expired, runner online and idle,
+# with no red check anywhere, and every plugin stopped publishing for days. The
+# trust boundary for secret-bearing publication is not the shape of this ref: it
+# is that `main` here is branch-protected, that the caller is dispatch-only so a
+# tag can never supply the workflow that receives the key, that the runner group
+# admits only this workflow onto the publisher host, and that the tag proofs
+# below run before the key is in scope.
 #
 # Trigger model: a SemVer annotated tag (`vMAJOR.MINOR.PATCH`) is the single
 # source of truth for a release. A thin caller dispatches this workflow only
@@ -49,6 +61,7 @@ jobs:
   build:
     name: Build verified candidate without secrets
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     permissions:
       contents: read
     outputs:
@@ -365,6 +378,13 @@ jobs:
   publish:
     name: Publish package on a fresh runner
     needs: build
+    # A job no runner can accept does not error — it waits out the 24-hour
+    # queue limit. This tier is one host behind a workflow allow-list, so the
+    # ways to become unschedulable are real and silent: the host down, the
+    # allow-list naming a ref the caller no longer uses. Fifteen minutes is
+    # generous for a job that uploads a zip in under a minute, and it turns
+    # "publishing is quietly broken" into a red check on the first release.
+    timeout-minutes: 15
     # Only the low-privilege, loopback-connected publisher tier receives the
     # Marketplace API key. It is intentionally not part of the generic CI or
     # deploy runner groups.
