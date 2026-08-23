@@ -16,5 +16,5 @@ on:
     branches: [main]
 jobs:
   ci:
-    uses: lvis-project/.github/.github/workflows/plugin-ci.yml@v1
+    uses: lvis-project/.github/.github/workflows/plugin-ci.yml@main
 ```
