@@ -3,9 +3,13 @@ on:
   workflow_call:
     inputs:
       sdk-ref:
-        description: 'SDK git ref to fetch schema from (tag or branch)'
+        description: >-
+          SDK git ref to fetch the manifest schema from. Leave unset: the ref
+          is derived from the `#ref` on the caller's own `@lvis/plugin-sdk`
+          dependency, so the manifest is checked against the schema the plugin
+          actually builds against. Set it only to override that deliberately.
         type: string
-        default: 'main'
+        default: ''
       manifest-path:
         description: 'Path to plugin.json relative to repo root'
         type: string
@@ -29,11 +33,45 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+      # The SDK version a plugin builds against is already stated, once, as the
+      # `#ref` on its `@lvis/plugin-sdk` dependency. Asking the caller to repeat
+      # it as a workflow input stores the same decision twice, and the two
+      # drifting is not loud: the manifest simply gets validated against a
+      # schema the plugin does not ship with. Every caller but one passed
+      # `main` while pinning v8 / v11, so that drift was the normal state.
+      # Derive it instead, and keep the input as an explicit override.
+      - name: Resolve SDK ref
+        id: sdk
+        shell: bash
+        env:
+          SDK_REF_INPUT: ${{ inputs.sdk-ref }}
+          MANIFEST_PATH: ${{ inputs.manifest-path }}
+        run: |
+          set -euo pipefail
+          ref="$SDK_REF_INPUT"
+          origin="sdk-ref input"
+          if [ -z "$ref" ]; then
+            ref=$(node -e '
+              const p = require("./package.json");
+              const spec = (p.devDependencies || {})["@lvis/plugin-sdk"]
+                || (p.dependencies || {})["@lvis/plugin-sdk"] || "";
+              const i = spec.indexOf("#");
+              process.stdout.write(i === -1 ? "" : spec.slice(i + 1));
+            ') || ref=""
+            origin="@lvis/plugin-sdk pin in package.json"
+          fi
+          if [ -z "$ref" ]; then
+            ref=main
+            origin="fallback (no sdk-ref input and no pinned SDK dependency)"
+            echo "::warning::validating ${MANIFEST_PATH} against the SDK schema on main — this repo pins no SDK version, so the schema it is checked against can move under it"
+          fi
+          echo "Manifest schema ref: ${ref} (from ${origin})"
+          echo "ref=${ref}" >> "$GITHUB_OUTPUT"
       - name: Checkout SDK schema
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
         with:
           repository: lvis-project/lvis-plugin-sdk
-          ref: ${{ inputs.sdk-ref }}
+          ref: ${{ steps.sdk.outputs.ref }}
           path: .sdk
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2.2.0
         with:

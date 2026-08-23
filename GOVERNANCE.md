@@ -100,6 +100,11 @@ described a `plugin-sdk/` submodule layout that no longer exists. Pin to a
 release tag rather than a bare commit — a tag survives a history rewrite in the
 SDK, and a bare commit does not, which is the same failure that took out CI here.
 
+That pin is the only place the version is written. `validate-plugin-manifest.yml`
+reads it out of `package.json` and fetches the manifest schema at the same ref,
+so a manifest is always checked against the schema the plugin actually ships
+against. Pass `sdk-ref` to the shared workflow only to override that on purpose.
+
 Pins are deliberately per-repo: a plugin adopts a new SDK major when its author
 is ready, and the version floor a plugin needs from the host lives in
 `requires.minAppVersion` in its `plugin.json`. To see where every repo currently
