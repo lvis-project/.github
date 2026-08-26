@@ -92,6 +92,10 @@ jobs:
           PLUGIN_SLUG: ${{ inputs.slug }}
           RELEASE_TAG: ${{ inputs.tag }}
         run: |
+          # shellcheck disable=SC2016
+          # SC2016 false positive — `$schema` inside the single-quoted
+          # `node -e '...'` body is the Agent Plugins document's JSON key,
+          # read literally by JS. Shell expansion here would corrupt it.
           set -euo pipefail
           if [[ ! "$RELEASE_TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
             echo "::error::tag must be vMAJOR.MINOR.PATCH SemVer with no leading zeros (got $RELEASE_TAG)"
