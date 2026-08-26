@@ -122,6 +122,62 @@ jobs:
               }
             done < <(git config --file .gitmodules --get-regexp '\.path$' | awk '{print $2}')
           fi
+      # A plugin panel that animates must also honour prefers-reduced-motion.
+      # DESIGN.md lists this in the Mandatory row for plugin surfaces, and in
+      # 2026-08 every one of the five shipped plugin UIs violated it — five for
+      # five. That is not five mistakes; it is a rule nothing was checking, so
+      # it lived only in prose.
+      #
+      # The check is deliberately coarse: it asks whether a repo that declares
+      # motion declares a guard anywhere under src/, not whether the guard
+      # covers every animated element. Per-file would be stricter but wrong —
+      # a panel legitimately guards motion it does not own (vendored spinners
+      # and toggles) from its own stylesheet, and a per-file rule would demand
+      # edits to vendored files that carry "do not redesign" headers.
+      #
+      # So: this proves a repo has thought about reduced motion. It does not
+      # prove coverage. Read a pass as "the floor is not zero".
+      - name: Reduced-motion gate (animated panels declare a guard)
+        shell: bash
+        run: |
+          cat > "$RUNNER_TEMP/reduced-motion-gate.mjs" <<'JS'
+          import { execSync } from "node:child_process";
+          import { readFileSync } from "node:fs";
+
+          const SOURCE = /^src\/.*\.(ts|tsx|js|jsx|mjs|cjs|css)$/;
+          const IS_TEST = /(^|\/)(__tests__|__mocks__)\//;
+          // `animation:`/`transition:` also match JS style assignments. That is
+          // intended — motion set from script is still motion on screen.
+          const MOTION = /@keyframes\b|\banimation(-duration|-name)?\s*[:=]|\btransition(-duration|-property)?\s*[:=]/;
+          const GUARD = /prefers-reduced-motion/;
+
+          const files = execSync("git ls-files", { encoding: "utf8" })
+            .split("\n")
+            .filter((f) => SOURCE.test(f) && !IS_TEST.test(f));
+
+          const animated = [];
+          let guarded = false;
+          for (const file of files) {
+            const text = readFileSync(file, "utf8");
+            if (GUARD.test(text)) guarded = true;
+            if (MOTION.test(text)) animated.push(file);
+          }
+
+          if (animated.length === 0) {
+            console.log("reduced-motion gate: no motion declared under src/ — nothing to guard");
+            process.exit(0);
+          }
+          if (guarded) {
+            console.log(`reduced-motion gate OK — ${animated.length} file(s) declare motion, a guard is present`);
+            process.exit(0);
+          }
+          console.error("::error::These files declare motion but no `prefers-reduced-motion` guard exists anywhere under src/:");
+          for (const file of animated) console.error(`::error file=${file}::declares motion, unguarded`);
+          console.error("Add a scoped @media (prefers-reduced-motion: reduce) block collapsing animation and");
+          console.error("transition durations to near-zero. See DESIGN.md, Plugin surfaces -> Mandatory.");
+          process.exit(1);
+          JS
+          node "$RUNNER_TEMP/reduced-motion-gate.mjs"
       - name: Install
         run: bun install --frozen-lockfile
       - name: Lint (if script exists)
