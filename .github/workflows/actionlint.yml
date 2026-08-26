@@ -198,7 +198,7 @@ jobs:
             const markerPath = path.join(hostileDir, "payload-executed");
             fs.writeFileSync(
               path.join(hostileDir, "payload.js"),
-              `require("node:fs").writeFileSync(${JSON.stringify(markerPath)}, "executed"); module.exports = { id: "meeting", version: "1.2.3" };`,
+              `require("node:fs").writeFileSync(${JSON.stringify(markerPath)}, "executed"); module.exports = { $schema: "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json", name: "meeting", version: "1.2.3" };`,
             );
             fs.symlinkSync("payload.js", path.join(hostileDir, "plugin.json"));
             const hostile = spawnSync(process.execPath, ["-e", readerScript], {
@@ -216,14 +216,41 @@ jobs:
             fs.mkdirSync(normalDir);
             fs.writeFileSync(
               path.join(normalDir, "plugin.json"),
-              JSON.stringify({ id: "meeting", version: "1.2.3" }),
+              JSON.stringify({
+                $schema: "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+                name: "meeting",
+                version: "1.2.3",
+              }),
             );
             const normal = spawnSync(process.execPath, ["-e", readerScript], {
               cwd: normalDir,
               encoding: "utf8",
             });
             if (normal.status !== 0 || normal.stdout !== "meeting\n1.2.3") {
-              throw new Error(`regular JSON manifest must be accepted: ${normal.stderr}`);
+              throw new Error(`Agent Plugins document must be accepted: ${normal.stderr}`);
+            }
+
+            // Counter-example. A pre-1.0.0 flat manifest also carries a
+            // top-level `name`, but there it is the human display name. If the
+            // reader ever stops discriminating on `$schema`, this fixture
+            // publishes under the slug "LVIS Meeting" — a different catalog
+            // entry than the manifest declares. Assert the refusal, and assert
+            // the display name never reaches stdout even so.
+            const flatDir = path.join(fixtureRoot, "flat");
+            fs.mkdirSync(flatDir);
+            fs.writeFileSync(
+              path.join(flatDir, "plugin.json"),
+              JSON.stringify({ id: "meeting", name: "LVIS Meeting", version: "1.2.3" }),
+            );
+            const flat = spawnSync(process.execPath, ["-e", readerScript], {
+              cwd: flatDir,
+              encoding: "utf8",
+            });
+            if (flat.status === 0) {
+              throw new Error("pre-1.0.0 flat manifest must be rejected, not published");
+            }
+            if (flat.stdout.includes("LVIS Meeting")) {
+              throw new Error("a flat manifest's display name must never be emitted as a catalog slug");
             }
           } finally {
             fs.rmSync(fixtureRoot, { recursive: true, force: true });

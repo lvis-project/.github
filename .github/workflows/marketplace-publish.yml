@@ -45,7 +45,7 @@ on:
   workflow_call:
     inputs:
       slug:
-        description: "Plugin slug (catalog id, e.g. 'meeting', 'local-indexer'). Must equal plugin.json.id."
+        description: "Plugin slug (catalog id, e.g. 'meeting', 'local-indexer'). Must equal plugin.json.name."
         type: string
         required: true
       tag:
@@ -126,23 +126,39 @@ jobs:
             exit 1
           fi
           # Defense-in-depth: cross-check that the caller-provided slug
-          # matches `plugin.json.id`. A drift here would publish under a
-          # different catalog entry than the manifest declares — silent
+          # matches the manifest's own name. A drift here would publish under
+          # a different catalog entry than the manifest declares — silent
           # corruption. Fail-closed.
-          if ! MANIFEST_ID=$(node -e '
+          #
+          # Under Agent Plugins 1.0.0 the catalog slug is the document's
+          # top-level `name`. A pre-1.0.0 flat manifest ALSO carries a
+          # top-level `name`, but there it holds the human display name —
+          # reading that as a slug would publish under the wrong entry. Gate
+          # on `$schema` so the two shapes can never be confused, and refuse
+          # anything that is not a document rather than guessing.
+          # shellcheck disable=SC2016
+          # SC2016 false positive — `$schema` inside the single-quoted
+          # `node -e '...'` body is the Agent Plugins document's JSON key,
+          # read literally by JS. Shell expansion here would corrupt it.
+          if ! MANIFEST_NAME=$(node -e '
             const m = require("./plugin.json");
-            const id = m.id;
-            if (typeof id !== "string" || id.length === 0) {
-              console.error("plugin.json.id must be a non-empty string");
+            const SCHEMA = "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json";
+            if (m.$schema !== SCHEMA) {
+              console.error("plugin.json must be an Agent Plugins 1.0.0 document ($schema: " + SCHEMA + ")");
               process.exit(2);
             }
-            process.stdout.write(id);
+            const name = m.name;
+            if (typeof name !== "string" || name.length === 0) {
+              console.error("plugin.json.name must be a non-empty string");
+              process.exit(2);
+            }
+            process.stdout.write(name);
           '); then
-            echo "::error::failed to read plugin.json id"
+            echo "::error::failed to read plugin.json name"
             exit 1
           fi
-          if [ "$PLUGIN_SLUG" != "$MANIFEST_ID" ]; then
-            echo "::error::caller-provided slug '$PLUGIN_SLUG' does not match plugin.json.id '$MANIFEST_ID' — fix the caller's 'with: slug:' input"
+          if [ "$PLUGIN_SLUG" != "$MANIFEST_NAME" ]; then
+            echo "::error::caller-provided slug '$PLUGIN_SLUG' does not match plugin.json.name '$MANIFEST_NAME' — fix the caller's 'with: slug:' input"
             exit 1
           fi
           echo "Publishing $PLUGIN_SLUG @ $TAG_VER"
@@ -473,15 +489,20 @@ jobs:
               console.error("plugin.json must contain valid JSON");
               process.exit(2);
             }
-            if (typeof manifest.id !== "string" || manifest.id.length === 0) {
-              console.error("plugin.json.id must be a non-empty string");
+            const SCHEMA = "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json";
+            if (manifest.$schema !== SCHEMA) {
+              console.error("plugin.json must be an Agent Plugins 1.0.0 document ($schema: " + SCHEMA + ")");
+              process.exit(2);
+            }
+            if (typeof manifest.name !== "string" || manifest.name.length === 0) {
+              console.error("plugin.json.name must be a non-empty string");
               process.exit(2);
             }
             if (typeof manifest.version !== "string" || manifest.version.length === 0) {
               console.error("plugin.json.version must be a non-empty string");
               process.exit(2);
             }
-            process.stdout.write(manifest.id + "\n" + manifest.version);
+            process.stdout.write(manifest.name + "\n" + manifest.version);
           // PUBLISH_MANIFEST_READER_END
           NODE
           then
@@ -489,10 +510,10 @@ jobs:
             exit 1
           fi
           manifest_values="$(cat "$RUNNER_TEMP/manifest-values")"
-          manifest_id="$(printf '%s\n' "$manifest_values" | sed -n '1p')"
+          manifest_name="$(printf '%s\n' "$manifest_values" | sed -n '1p')"
           manifest_version="$(printf '%s\n' "$manifest_values" | sed -n '2p')"
-          if [ "$PLUGIN_SLUG" != "$manifest_id" ]; then
-            echo "::error::caller-provided slug '$PLUGIN_SLUG' does not match plugin.json.id '$manifest_id'"
+          if [ "$PLUGIN_SLUG" != "$manifest_name" ]; then
+            echo "::error::caller-provided slug '$PLUGIN_SLUG' does not match plugin.json.name '$manifest_name'"
             exit 1
           fi
           if [ "$plugin_version" != "$manifest_version" ]; then
