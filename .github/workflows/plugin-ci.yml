@@ -3,8 +3,22 @@ on:
   workflow_call:
     inputs:
       node-version:
+        # Match the runtime plugins actually execute on, not the newest LTS.
+        # Out-of-process plugins are spawned by the host as `process.execPath`
+        # (the Electron binary) with ELECTRON_RUN_AS_NODE=1, so their Node IS
+        # Electron's bundled Node -- 24.17.0 for the host's Electron 43. CI sat
+        # on '20' instead, which was two problems at once: Node 20 reached
+        # end-of-life on 2026-04-30, and a plugin's tests were being run four
+        # majors below the runtime that runs it in production. The gap was not
+        # theoretical -- jsdom 30 pulls undici 8, which calls
+        # `worker_threads.markAsUncloneable` (Node 22+). Production has it;
+        # only CI did not, so a green-on-20 suite could not tell anyone whether
+        # the plugin worked where it actually runs.
+        #
+        # This tracks the host's Electron. When lvis-app moves Electron majors,
+        # re-read Electron's bundled Node and move this with it.
         type: string
-        default: '20'
+        default: '24'
       bun-version:
         type: string
         default: '1.1.38'
