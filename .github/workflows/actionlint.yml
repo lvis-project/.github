@@ -104,11 +104,11 @@ jobs:
           }
           const noProxyCalls = publish.split("curl --noproxy '*'").length - 1;
           if (noProxyCalls < 3) {
-            throw new Error("local origin health, publish, and catalog requests must bypass proxies");
+            throw new Error("local origin health, publish, and version-verification requests must bypass proxies");
           }
           for (const localEndpoint of [
             "${MARKETPLACE_ORIGIN}/api/v1/plugins/${PLUGIN_SLUG}/versions",
-            "${MARKETPLACE_ORIGIN}/api/v1/catalog",
+            "${MARKETPLACE_ORIGIN}/api/v1/plugins/${PLUGIN_SLUG}/versions/${PLUGIN_VERSION}",
           ]) {
             if (!publish.includes(localEndpoint)) {
               throw new Error("publish job must use the fixed loopback origin for " + localEndpoint);
