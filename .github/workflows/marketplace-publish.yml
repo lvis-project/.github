@@ -617,62 +617,50 @@ jobs:
           echo "::error::Marketplace publish failed with HTTP $status"
           exit 1
 
-      - name: Verify idempotent 409 against catalog commit_hash
-        # Compares the catalog's `latest_commit_hash` for this slug against
-        # the workflow's verified candidate SHA to distinguish a benign
-        # idempotent retry from a malicious tag rewrite. Fail-closed: any
-        # case where the catalog doesn't surface a matching `commit_hash`
-        # for our PLUGIN_VERSION (slug missing, latest is a different
-        # version, commit_hash field missing) is treated as an error.
-        #
-        # Workaround note: the catalog summary exposes `latest_*` only.
-        # A per-version `GET /plugins/{slug}/versions/{version}` route
-        # would let us compare any version, not just latest. Tracked as a
-        # follow-up issue against lvis-marketplace; until then this step
-        # only handles the common case (publish 409 because the version
-        # we tried IS the catalog latest).
+      - name: Verify idempotent 409 against exact published version
+        # A 409 from POST /versions is ambiguous on its own — compare this
+        # exact (slug, version)'s `commit_hash` (GET
+        # /plugins/{slug}/versions/{version}) against the workflow's
+        # verified candidate SHA to distinguish a benign idempotent retry
+        # from a malicious tag rewrite. This looks up the version directly
+        # rather than through the catalog's latest pointer, so it also
+        # covers a version that published successfully but has not (yet)
+        # advanced the catalog's latest pointer. Fail-closed: 404 or a
+        # non-matching (including absent) `commit_hash` is treated as an
+        # error.
         if: steps.publish.outputs.outcome == 'needs-verify'
-        # No Authorization header — the catalog endpoint is public read,
-        # so we don't unnecessarily expose MARKETPLACE_API_KEY here.
+        # Same request pattern as the publish call above (loopback origin,
+        # `--noproxy`, Authorization header) — this endpoint sits behind the
+        # same visibility chokepoint as download, so an internal-only plugin
+        # needs the same credentials this job already carries.
         env:
+          MARKETPLACE_API_KEY: ${{ secrets.MARKETPLACE_API_KEY }}
           PLUGIN_SLUG: ${{ inputs.slug }}
         run: |
-          catalog_response=$(mktemp)
-          catalog_status=$(curl --noproxy '*' -sS -o "$catalog_response" -w "%{http_code}" \
-            "${MARKETPLACE_ORIGIN}/api/v1/catalog")
-          if [ "$catalog_status" != "200" ]; then
-            echo "::error::failed to GET catalog (HTTP $catalog_status) — cannot verify idempotent re-publish"
-            cat "$catalog_response"
+          set -euo pipefail
+          version_response=$(mktemp)
+          version_status=$(curl --noproxy '*' -sS -o "$version_response" -w "%{http_code}" \
+            -H "Authorization: Bearer ${MARKETPLACE_API_KEY}" \
+            "${MARKETPLACE_ORIGIN}/api/v1/plugins/${PLUGIN_SLUG}/versions/${PLUGIN_VERSION}")
+          if [ "$version_status" = "404" ]; then
+            echo "::error::${PLUGIN_SLUG} @ ${PLUGIN_VERSION} not found after 409, refusing"
+            cat "$version_response"
             exit 1
           fi
-          PYOUT=$(PLUGIN_VERSION="$PLUGIN_VERSION" PLUGIN_SLUG="$PLUGIN_SLUG" python3 - "$catalog_response" <<'PY'
-          import json, os, sys
+          if [ "$version_status" != "200" ]; then
+            echo "::error::failed to GET ${PLUGIN_SLUG} @ ${PLUGIN_VERSION} (HTTP $version_status) — cannot verify idempotent re-publish"
+            cat "$version_response"
+            exit 1
+          fi
+          published_sha=$(python3 - "$version_response" <<'PY'
+          import json, sys
           with open(sys.argv[1]) as f:
-            items = json.load(f)
-          slug = os.environ["PLUGIN_SLUG"]
-          for p in items:
-            if p.get("slug") == slug:
-              print(p.get("latest_stable_version", ""))
-              print(p.get("latest_commit_hash", ""))
-              sys.exit(0)
+            body = json.load(f)
+          print(body.get("commit_hash") or "")
           PY
           )
-          catalog_latest=$(echo "$PYOUT" | sed -n '1p')
-          catalog_sha=$(echo "$PYOUT" | sed -n '2p')
-          if [ -z "$catalog_latest" ]; then
-            echo "::error::${PLUGIN_SLUG} not found in catalog after 409 — refusing to silently succeed"
+          if [ -z "$published_sha" ] || [ "$published_sha" != "$CANDIDATE_SHA" ]; then
+            echo "::error::${PLUGIN_SLUG} @ ${PLUGIN_VERSION} already published from a different sha; bump plugin.json and tag"
             exit 1
           fi
-          if [ "$catalog_latest" != "$PLUGIN_VERSION" ]; then
-            echo "::error::tag v${PLUGIN_VERSION} got 409 but catalog latest is v${catalog_latest} (not the version we tried to publish). Bump plugin.json above v${catalog_latest} and use a new tag."
-            exit 1
-          fi
-          if [ -z "$catalog_sha" ]; then
-            echo "::error::tag v${PLUGIN_VERSION} matches catalog latest but commit_hash not surfaced — refusing to silently succeed"
-            exit 1
-          fi
-          if [ "$catalog_sha" != "$CANDIDATE_SHA" ]; then
-            echo "::error::tag v${PLUGIN_VERSION} was already published from $catalog_sha — refusing silent re-publish from $CANDIDATE_SHA. Bump plugin.json + use a new tag."
-            exit 1
-          fi
-          echo "Idempotent retry — catalog already holds v${PLUGIN_VERSION} from matching sha ${catalog_sha}"
+          echo "::notice::Idempotent retry — ${PLUGIN_SLUG} @ ${PLUGIN_VERSION} already published from matching sha ${published_sha}"
